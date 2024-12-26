@@ -70,6 +70,7 @@ var defaultFileContent = []byte(`{
             "pdb"           : "~databases/pdb70",
             "environmental" : "~databases/colabfold_envdb_202108",
 			"environmentalpair" : "~databases/spire_ctg10_2401_db",
+			"nucl"          : "~databases/nucl",
             // paths for templates
             "pdb70"         : "~databases/pdb70",
             "pdbdivided"    : "~databases/pdbdivided",
@@ -160,6 +161,7 @@ type ConfigColabFoldPaths struct {
 	Pdb               string `json:"pdb"`
 	Environmental     string `json:"environmental"`
 	EnvironmentalPair string `json:"environmentalpair"`
+	Nucleotide        string `json:"nucl"`
 	Pdb70             string `json:"pdb70"`
 	PdbDivided        string `json:"pdbdivided"`
 	PdbObsolete       string `json:"pdbobsolete"`

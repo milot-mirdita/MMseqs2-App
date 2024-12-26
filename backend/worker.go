@@ -1117,6 +1117,125 @@ rm -rf -- "${BASE}/tmp"
 			log.Print("Process finished gracefully without error")
 		}
 		return nil
+	case NuclMsaJob:
+		resultBase := filepath.Join(config.Paths.Results, string(request.Id))
+
+		scriptPath := filepath.Join(resultBase, "nuclmsa.sh")
+		script, err := os.Create(scriptPath)
+		if err != nil {
+			return &JobExecutionError{err}
+		}
+		script.WriteString(`#!/bin/bash -e
+MMSEQS="$1"
+QUERY="$2"
+BASE="$4"
+DB1="$5"
+export MMSEQS_CALL_DEPTH=1
+mkdir -p "${BASE}"
+"${MMSEQS}" createdb "${QUERY}" "${BASE}/qdb" --dbtype 1
+"${MMSEQS}" search "${BASE}/qdb" "${DB1}" "${BASE}/res" "${BASE}/tmp1" $SEARCH_PARAM
+"${MMSEQS}" result2msa "${BASE}/qdb" "${DB1}.idx" "${BASE}/res" "${BASE}/nucl.a3m" --msa-format-mode 6 --db-load-mode 2
+"${MMSEQS}" rmdb "${BASE}/qdb"
+"${MMSEQS}" rmdb "${BASE}/qdb_h"
+"${MMSEQS}" rmdb "${BASE}/res"
+rm -f -- "${BASE}/prof_res"*
+rm -rf -- "${BASE}/tmp1"
+`)
+		err = script.Close()
+		if err != nil {
+			return &JobExecutionError{err}
+		}
+
+		// modes := strings.Split(job.Mode, "-")
+		// useEnv := isIn("env", modes) != -1
+		// useTemplates := isIn("notemplates", modes) == -1
+		// useFilter := isIn("nofilter", modes) == -1
+		// taxonomy := isIn("taxonomy", modes) == 1
+		// m8out := isIn("m8output", modes) == 1
+		// var b2i = map[bool]int{false: 0, true: 1}
+
+		parameters := []string{
+			"/bin/sh",
+			scriptPath,
+			config.Paths.Mmseqs,
+			filepath.Join(resultBase, "job.fasta"),
+			"",
+			resultBase,
+			config.Paths.ColabFold.Nucleotide,
+		}
+
+		cmd, done, err := execCommand(config.Verbose, parameters...)
+		if err != nil {
+			return &JobExecutionError{err}
+		}
+
+		select {
+		case <-time.After(1 * time.Hour):
+			if err := KillCommand(cmd); err != nil {
+				log.Printf("Failed to kill: %s\n", err)
+			}
+			return &JobTimeoutError{}
+		case err := <-done:
+			if err != nil {
+				return &JobExecutionError{err}
+			}
+
+			path := filepath.Join(filepath.Clean(config.Paths.Results), string(request.Id))
+			file, err := os.Create(filepath.Join(path, "mmseqs_results_"+string(request.Id)+".tar.gz"))
+			if err != nil {
+				return &JobExecutionError{err}
+			}
+
+			err = func() (err error) {
+				gw := gzip.NewWriter(file)
+				defer func() {
+					cerr := gw.Close()
+					if err == nil {
+						err = cerr
+					}
+				}()
+				tw := tar.NewWriter(gw)
+				defer func() {
+					cerr := tw.Close()
+					if err == nil {
+						err = cerr
+					}
+				}()
+
+				suffix := ".a3m"
+				path := filepath.Join(resultBase, "nucl"+suffix)
+				if err := addFile(tw, path); err != nil {
+					return err
+				}
+				os.Remove(path)
+
+				if err := addFile(tw, scriptPath); err != nil {
+					return err
+				}
+				os.Remove(scriptPath)
+
+				return nil
+			}()
+
+			if err != nil {
+				file.Close()
+				return &JobExecutionError{err}
+			}
+
+			if err = file.Sync(); err != nil {
+				file.Close()
+				return &JobExecutionError{err}
+			}
+
+			if err = file.Close(); err != nil {
+				return &JobExecutionError{err}
+			}
+		}
+
+		if config.Verbose {
+			log.Print("Process finished gracefully without error")
+		}
+		return nil
 	case IndexJob:
 		file := filepath.Join(config.Paths.Databases, job.Path)
 		params, err := ReadParams(file + ".params")
