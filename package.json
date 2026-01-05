@@ -124,7 +124,7 @@
     "imagemin": "^8.0.1",
     "imagemin-pngquant": "^9.0.2",
     "mini-css-extract-plugin": "^2.7.6",
-    "ngl": "2.0.1",
+    "molstar": "^5.4.1",
     "pako": "^2.1.0",
     "pulchra-wasm": "^0.0.3",
     "sass": "<1.33.0",
@@ -133,11 +133,11 @@
     "svg2png": "^4.1.1",
     "tmalign-wasm": "^0.0.6",
     "url-loader": "^4.1.1",
-    "vue": "^2.7.16",
-    "vue-loader": "^15.11.1",
+    "vue": "<2.7.0",
+    "vue-loader": "<17.0.0",
     "vue-router": "<4.0.0",
     "vue-style-loader": "^4.1.3",
-    "vue-template-compiler": "^2.7.16",
+    "vue-template-compiler": "<2.7.0",
     "vuedraggable": "^2.24.3",
     "vuetify": "<=2.6.12",
     "vuetify-loader": "<1.9.0",
@@ -149,8 +149,6 @@
   },
   "dependencies": {
     "d3": "^7.9.0",
-    "d3-sankey": "^0.12.3",
-    "interactjs": "^1.10.27",
-    "mitt": "^3.0.1"
+    "d3-sankey": "^0.12.3"
   }
 }

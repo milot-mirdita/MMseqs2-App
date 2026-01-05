@@ -37,7 +37,7 @@ import StructureViewerMixin from './StructureViewerMixin.vue';
 import StructureViewerToolbar from './StructureViewerToolbar.vue';
 import StructureViewerTooltip from './StructureViewerTooltip.vue';
 import { getPdbText, transformStructure } from './Utilities.js'
-import { download, ColormakerRegistry } from 'ngl'
+// import { download, ColormakerRegistry } from 'ngl'
 
 const processPdb = (rawpdb) => {
     let outpdb = '';

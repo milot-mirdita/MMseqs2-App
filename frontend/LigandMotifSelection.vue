@@ -61,7 +61,7 @@
 
 <script>
 import ModalDialog from "./ModalDialog.vue";
-import { Selection } from 'ngl';
+// import { Selection } from 'ngl';
 import { splitAlphaNum } from "./Utilities";
 
 function sortResidueStrings(a, b) {

@@ -138,7 +138,8 @@ module.exports = (env, argv) => {
         resolve: {
             extensions: ['.js', '.vue', '.json'],
             alias: {
-                'vue$': 'vue/dist/vue.runtime.esm.js'
+                'vue$': 'vue/dist/vue.runtime.esm.js',
+                'ngl$': path.resolve(__dirname, './lib/ngl-shim.js')
             }
         },
         experiments: {

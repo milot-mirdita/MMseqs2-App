@@ -38,42 +38,24 @@
 import StructureViewerTooltip from './StructureViewerTooltip.vue';
 import StructureViewerToolbar from './StructureViewerToolbar.vue';
 import StructureViewerMixin from './StructureViewerMixin.vue';
-import { mockPDB, makeSubPDB, transformStructure, makeMatrix4, storeChains, revertChainInfo } from './Utilities.js';
+import { mockPDB, downloadBlob } from './Utilities.js';
 import { pulchra } from 'pulchra-wasm';
 import { tmalign, parse as parseTMOutput, parseMatrix as parseTMMatrix } from 'tmalign-wasm';
+import { MolScriptBuilder as MS } from 'molstar/lib/mol-script/language/builder';
+import { Script } from 'molstar/lib/mol-script/script';
+import { parsePDB } from 'molstar/lib/mol-io/reader/pdb/parser';
+import { parseCifText } from 'molstar/lib/mol-io/reader/cif/text/parser';
+import { StructureSelection } from 'molstar/lib/mol-model/structure';
+import { Color } from 'molstar/lib/mol-util/color';
 
-import Panel from './Panel.vue';
-import { Shape, Selection, download, ColormakerRegistry, PdbWriter, Color, concatStructures, StructureComponent } from 'ngl';
-
-// Create NGL arrows from array of ([X, Y, Z], [X, Y, Z]) pairs
-// Get XYZ coordinates of CA of a given residue
-const xyz = (structure, resIndex) => {
-    var rp = structure.getResidueProxy();
-    var ap = structure.getAtomProxy();
-    rp.index = resIndex;
-    ap.index = rp.getAtomIndexByName('CA');
-    return [ap.x, ap.y, ap.z];
-}
-
-// Save indices of matching columns in an alignment
-const getMatchingColumns = (alignment) => {
-    let cols_q = [];
-    let cols_t = [];
-    let id_q = alignment.qStartPos;
-    let id_t = alignment.dbStartPos;
-    for (let i = 0; i < alignment.qAln.length; i++) {
-        if (alignment.qAln[i] === '-' || alignment.dbAln[i] === '-') {
-            if (alignment.qAln[i] === '-') id_t++;
-            else id_q++;
-        } else {
-            cols_q.push(id_q);
-            cols_t.push(id_t);
-            id_q++;
-            id_t++;
-        }
-    }
-    return [cols_q, cols_t]
-}
+const DEFAULT_QUERY_COLOR = 0x1e88e5;
+const DEFAULT_QUERY_UNALIGNED_COLOR = 0xa5cff5;
+const DEFAULT_TARGET_COLOR = 0xffc107;
+const DEFAULT_TARGET_UNALIGNED_COLOR = 0xffe699;
+const DEFAULT_HIGHLIGHT_COLOR = 0xff5252;
+const DEFAULT_ARROW_COLOR = 0x9e9e9e;
+const MAX_ARROW_PAIRS = 10;
+const CHAIN_ID_POOL = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
 
 // Get chain from structure name like Structure_A
 const getChainName = (name) => {
@@ -90,48 +72,531 @@ const getChainName = (name) => {
     return 'A';
 }
 
-const getAccession = (name) => {
-    // HACK FIXME fix AF chain names
-    if (/_v[0-9]+$/.test(name)) {
-        return name;
+const extractChainFromName = (name) => {
+    if (!name) return null;
+    const trimmed = String(name).trim();
+    if (/_v[0-9]+$/.test(trimmed)) {
+        return null;
     }
-    let pos = name.lastIndexOf('_');
-    return pos != -1 ? name.substring(0, pos) : name;
-}
+    if (trimmed.length === 1) {
+        return trimmed;
+    }
+    const match = trimmed.match(/(?:_|:|\|)([A-Za-z0-9])$/);
+    if (match) {
+        return match[1];
+    }
+    return null;
+};
 
-// Get coordinates of all atoms found in given selection
-// skip consecutive res indices as they are most likely alternative locations
-// foldseek always chooses the first alt locations, so we mimic this behavior
-const getAtomXYZ = (structure, sele) => {
-    const xyz = [];
-    let lastResidueIndex = -1;
-
-    structure.eachAtom(ap => {
-        if (ap.resno !== lastResidueIndex) {
-            xyz.push([ap.x, ap.y, ap.z]);
-            lastResidueIndex = ap.resno;
+const resolveChainFromName = (name, chainSet, chainList) => {
+    const chain = extractChainFromName(name);
+    if (!chain) {
+        return null;
+    }
+    if (!chainSet || chainSet.size === 0) {
+        return chain;
+    }
+    if (chainSet.has(chain)) {
+        return chain;
+    }
+    const chainIndex = Number.parseInt(chain, 10);
+    if (Number.isFinite(chainIndex)) {
+        const zeroIndex = chainIndex - 1;
+        if (zeroIndex >= 0 && chainList && zeroIndex < chainList.length) {
+            return chainList[zeroIndex];
         }
-    }, sele); 
-
-    return xyz;
-}
-
-const colorblindColors = ColormakerRegistry.addScheme(function() {
-    let colors = [0x991999, 0x00BFBF, 0xE9967A, 0x009E73, 0xF0E442, 0x0072B2, 0xD55E00, 0xCC79A7];
-    this.atomColor = function(atom) {
-        return colors[atom.chainIndex % colors.length];
     }
-}, "colorblindColors")
+    return null;
+};
 
-const getPdbText = comp => {
-    let pw = new PdbWriter(comp.structure, { renumberSerial: false });
-    return pw.getData().split('\n').filter(line => line.startsWith('ATOM')).join('\n');
-}
+const assignAlignmentChains = (alignments, nameGetter, chainSet = null, serialMap = null, lengthKey = null) => {
+    const map = new Map();
+    const used = new Set();
+    const chainList = chainSet && chainSet.size > 0 ? Array.from(chainSet) : null;
+    alignments.forEach((alignment, index) => {
+        const chain = resolveChainFromName(nameGetter(alignment), chainSet, chainList);
+        if (chain) {
+            map.set(index, chain);
+            used.add(chain);
+        }
+    });
+    if (chainSet && chainSet.size > 0 && serialMap && serialMap.size > 0 && lengthKey) {
+        const lengthMap = new Map();
+        serialMap.forEach((resnos, chain) => {
+            lengthMap.set(chain, resnos.length);
+        });
+        const candidatesByLength = new Map();
+        lengthMap.forEach((len, chain) => {
+            if (used.has(chain)) {
+                return;
+            }
+            if (!candidatesByLength.has(len)) {
+                candidatesByLength.set(len, []);
+            }
+            candidatesByLength.get(len).push(chain);
+        });
+        alignments.forEach((alignment, index) => {
+            if (map.has(index)) {
+                return;
+            }
+            const len = Number(alignment[lengthKey]);
+            if (!Number.isFinite(len)) {
+                return;
+            }
+            const candidates = candidatesByLength.get(len);
+            if (candidates && candidates.length === 1) {
+                const chain = candidates[0];
+                map.set(index, chain);
+                used.add(chain);
+                candidatesByLength.delete(len);
+            }
+        });
+    }
+    const pool = chainList && chainList.length > 0 ? chainList : CHAIN_ID_POOL.split('');
+    let poolIndex = 0;
+    alignments.forEach((alignment, index) => {
+        if (map.has(index)) {
+            return;
+        }
+        while (poolIndex < pool.length && used.has(pool[poolIndex])) {
+            poolIndex += 1;
+        }
+        const chain = pool[poolIndex] || 'A';
+        map.set(index, chain);
+        used.add(chain);
+        poolIndex += 1;
+    });
+    return map;
+};
+
+const toMolstarColor = (value, fallback) => {
+    if (typeof value === 'number' && Number.isFinite(value)) {
+        return Color(value);
+    }
+    if (typeof value === 'string') {
+        const trimmed = value.trim();
+        if (trimmed.length > 0) {
+            const hex = trimmed.startsWith('#') ? trimmed.slice(1) : trimmed;
+            const parsed = Number.parseInt(hex, 16);
+            if (Number.isFinite(parsed)) {
+                return Color(parsed);
+            }
+        }
+    }
+    return Color(fallback);
+};
+
+const isChainToken = (token) => {
+    return typeof token === 'string' && /^[A-Za-z]$/.test(token);
+};
+
+const parseAtomLine = (line) => {
+    if (!line.startsWith('ATOM') && !line.startsWith('HETATM')) return null;
+    let chainId = line.length >= 22 ? line[21] : '';
+    let resno = Number.parseInt(line.slice(22, 26).trim(), 10);
+    let resname = line.slice(17, 20).trim();
+    if (!Number.isFinite(resno) || !resname) {
+        const parts = line.trim().split(/\s+/);
+        if (parts.length >= 6 && isChainToken(parts[4]) && !Number.isNaN(Number.parseInt(parts[5], 10))) {
+            chainId = parts[4];
+            resno = Number.parseInt(parts[5], 10);
+            resname = parts[3] || resname;
+        } else if (parts.length >= 5) {
+            resno = Number.parseInt(parts[4], 10);
+            resname = parts[3] || resname;
+        }
+    }
+    return { chainId, resno, resname };
+};
+
+const buildSerialResidueMap = (pdb) => {
+    const map = new Map();
+    if (!pdb) {
+        return map;
+    }
+    const lastResidue = new Map();
+    for (const line of pdb.split('\n')) {
+        const parsed = parseAtomLine(line);
+        if (!parsed) {
+            continue;
+        }
+        const chainKey = parsed.chainId && parsed.chainId.trim() ? parsed.chainId.trim() : '_';
+        const residueKey = `${chainKey}:${parsed.resno}:${parsed.resname}`;
+        if (lastResidue.get(chainKey) === residueKey) {
+            continue;
+        }
+        lastResidue.set(chainKey, residueKey);
+        if (!map.has(chainKey)) map.set(chainKey, []);
+        map.get(chainKey).push(parsed.resno);
+    }
+    return map;
+};
+
+const buildSerialResidueMapFromPdbTokens = (tokens) => {
+    const map = new Map();
+    if (!tokens || !tokens.data || !tokens.indices) {
+        return map;
+    }
+    const { data, indices } = tokens;
+    const count = tokens.count || 0;
+    const lastResidue = new Map();
+    for (let i = 0; i < count; i += 1) {
+        const start = indices[i * 2];
+        const end = indices[i * 2 + 1];
+        if (start === undefined || end === undefined) {
+            continue;
+        }
+        const line = data.substring(start, end);
+        const parsed = parseAtomLine(line);
+        if (!parsed) {
+            continue;
+        }
+        const chainKey = parsed.chainId && parsed.chainId.trim() ? parsed.chainId.trim() : '_';
+        const residueKey = `${chainKey}:${parsed.resno}:${parsed.resname}`;
+        if (lastResidue.get(chainKey) === residueKey) {
+            continue;
+        }
+        lastResidue.set(chainKey, residueKey);
+        if (!map.has(chainKey)) {
+            map.set(chainKey, []);
+        }
+        map.get(chainKey).push(parsed.resno);
+    }
+    return map;
+};
+
+const getChainIdsFromPdbTokens = (tokens) => {
+    const chains = new Set();
+    if (!tokens || !tokens.data || !tokens.indices) {
+        return chains;
+    }
+    const { data, indices } = tokens;
+    const count = tokens.count || 0;
+    for (let i = 0; i < count; i += 1) {
+        const start = indices[i * 2];
+        const end = indices[i * 2 + 1];
+        if (start === undefined || end === undefined) {
+            continue;
+        }
+        const line = data.substring(start, end);
+        const parsed = parseAtomLine(line);
+        if (!parsed) {
+            continue;
+        }
+        if (parsed.chainId && parsed.chainId.trim()) {
+            chains.add(parsed.chainId.trim());
+        }
+    }
+    return chains;
+};
+
+const extractChainsAndSerialMapFromCif = (cifFile) => {
+    const chainIds = new Set();
+    const serialMap = new Map();
+    const block = cifFile?.blocks?.[0];
+    const atomSite = block?.categories?.atom_site || block?.categories?.['atom_site'];
+    if (!atomSite) {
+        return { chainIds, serialMap };
+    }
+    const groupField = atomSite.getField('group_PDB');
+    const authAsymField = atomSite.getField('auth_asym_id');
+    const labelAsymField = atomSite.getField('label_asym_id');
+    const authSeqField = atomSite.getField('auth_seq_id');
+    const labelSeqField = atomSite.getField('label_seq_id');
+    const authCompField = atomSite.getField('auth_comp_id');
+    const labelCompField = atomSite.getField('label_comp_id');
+    const lastResidue = new Map();
+    const rowCount = atomSite.rowCount || 0;
+    for (let i = 0; i < rowCount; i += 1) {
+        const group = (groupField ? groupField.str(i) : '') || 'ATOM';
+        if (group !== 'ATOM' && group !== 'HETATM') {
+            continue;
+        }
+        const chainIdRaw = (authAsymField?.str(i) || labelAsymField?.str(i) || '').trim();
+        const chainKey = chainIdRaw || '_';
+        const resnoStr = (authSeqField?.str(i) || labelSeqField?.str(i) || '').trim();
+        const resno = Number.parseInt(resnoStr, 10);
+        if (!Number.isFinite(resno)) {
+            continue;
+        }
+        const resname = (authCompField?.str(i) || labelCompField?.str(i) || 'UNK').trim();
+        const residueKey = `${chainKey}:${resno}:${resname}`;
+        if (lastResidue.get(chainKey) === residueKey) {
+            continue;
+        }
+        lastResidue.set(chainKey, residueKey);
+        if (!serialMap.has(chainKey)) {
+            serialMap.set(chainKey, []);
+        }
+        serialMap.get(chainKey).push(resno);
+        if (chainIdRaw) {
+            chainIds.add(chainIdRaw);
+        }
+    }
+    return { chainIds, serialMap };
+};
+
+const readQueryDataWithMolIo = async (queryPdb, format) => {
+    if (format === 'pdb') {
+        const parsed = await parsePDB(queryPdb, 'query').run();
+        if (parsed.isError) {
+            return null;
+        }
+        const tokens = parsed.result?.lines;
+        console.log(tokens)
+        return {
+            chainIds: getChainIdsFromPdbTokens(tokens),
+            serialMap: buildSerialResidueMapFromPdbTokens(tokens),
+        };
+    }
+    if (format === 'mmcif') {
+        const parsed = await parseCifText(queryPdb).run();
+        if (parsed.isError) {
+            return null;
+        }
+        return extractChainsAndSerialMapFromCif(parsed.result);
+    }
+    return null;
+};
+
+const mapRangesToAuth = (ranges, serialMap) => {
+    if (!serialMap || serialMap.length === 0) {
+        return ranges;
+    }
+    return ranges.map(range => {
+        const startIdx = Math.max(1, Math.round(range.start));
+        const endIdx = Math.max(1, Math.round(range.end));
+        const startPos = Math.min(serialMap.length, startIdx) - 1;
+        const endPos = Math.min(serialMap.length, endIdx) - 1;
+        const startResno = serialMap[startPos];
+        const endResno = serialMap[endPos];
+        if (!Number.isFinite(startResno) || !Number.isFinite(endResno)) return null;
+        return {
+            start: Math.min(startResno, endResno),
+            end: Math.max(startResno, endResno),
+        };
+    }).filter(Boolean);
+};
+
+const mapSerialPosition = (serialPos, serialMap) => {
+    if (!Number.isFinite(serialPos)) {
+        return null;
+    }
+    if (!serialMap || serialMap.length === 0) {
+        return serialPos;
+    }
+    const index = Math.max(1, Math.round(serialPos));
+    const pos = Math.min(serialMap.length, index) - 1;
+    const resno = serialMap[pos];
+    return Number.isFinite(resno) ? resno : serialPos;
+};
+
+const buildChainExpression = (chain, ranges, useChainTest) => {
+    const groupBy = MS.struct.atomProperty.macromolecular.residueKey();
+    const chainTest = useChainTest
+        ? MS.core.rel.eq([
+            MS.struct.atomProperty.macromolecular.auth_asym_id(),
+            chain,
+        ])
+        : null;
+    if (!ranges || ranges.length === 0) {
+        return chainTest
+            ? MS.struct.generator.atomGroups({ 'chain-test': chainTest, 'group-by': groupBy })
+            : MS.struct.generator.all();
+    }
+    const rangeExpressions = ranges.map(range => MS.struct.generator.atomGroups({
+        ...(chainTest ? { 'chain-test': chainTest } : {}),
+        'residue-test': MS.core.rel.inRange([
+            MS.struct.atomProperty.macromolecular.auth_seq_id(),
+            range.start,
+            range.end,
+        ]),
+        'group-by': groupBy,
+    }));
+    return rangeExpressions.length === 1
+        ? rangeExpressions[0]
+        : MS.struct.combinator.merge(rangeExpressions);
+};
+
+const getSelectionLoci = (expression, structureRef) => {
+    const data = structureRef?.cell?.obj?.data;
+    if (!data || !expression) {
+        return null;
+    }
+    const selection = Script.getStructureSelection(expression, data);
+    return StructureSelection.toLociWithSourceUnits(selection);
+};
+
+const getSelectionLociSafe = (expression, structureRef) => {
+    const data = structureRef?.cell?.obj?.data;
+    if (!data || !expression) {
+        return null;
+    }
+    const selection = Script.getStructureSelection(expression, data);
+    if (StructureSelection.isEmpty(selection)) {
+        return null;
+    }
+    return StructureSelection.toLociWithSourceUnits(selection);
+};
+
+const buildResidueAtomExpression = (chain, resno, useChainTest, atomId = 'CA') => {
+    const groupBy = MS.struct.atomProperty.macromolecular.residueKey();
+    const params = {
+        'residue-test': MS.core.rel.eq([
+            MS.struct.atomProperty.macromolecular.auth_seq_id(),
+            resno,
+        ]),
+        'group-by': groupBy,
+    };
+    if (useChainTest) {
+        params['chain-test'] = MS.core.rel.eq([
+            MS.struct.atomProperty.macromolecular.auth_asym_id(),
+            chain,
+        ]);
+    }
+    if (atomId) {
+        params['atom-test'] = MS.core.rel.eq([
+            MS.struct.atomProperty.macromolecular.label_atom_id(),
+            atomId,
+        ]);
+    }
+    return MS.struct.generator.atomGroups(params);
+};
+
+const extractAtomLines = (pdb) => {
+    if (!pdb) {
+        return [];
+    }
+    return pdb.split('\n').filter(line => line.startsWith('ATOM'));
+};
+
+const mergePdbChunks = (chunks) => {
+    let serial = 1;
+    const lines = [];
+    chunks.forEach(chunk => {
+        const atomLines = extractAtomLines(chunk);
+        atomLines.forEach(line => {
+            const padded = line.padEnd(80, ' ');
+            const serialStr = serial.toString().padStart(5);
+            lines.push(`${padded.slice(0, 6)}${serialStr}${padded.slice(11)}`);
+            serial++;
+        });
+    });
+    return lines.length > 0 ? `${lines.join('\n')}\nEND\n` : '';
+};
+
+const transformPdb = (pdb, t, u) => {
+    if (!pdb) {
+        return pdb;
+    }
+    return pdb.split('\n').map(line => {
+        if (!line.startsWith('ATOM') && !line.startsWith('HETATM')) {
+            return line;
+        }
+        const x = Number.parseFloat(line.slice(30, 38));
+        const y = Number.parseFloat(line.slice(38, 46));
+        const z = Number.parseFloat(line.slice(46, 54));
+        if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
+            return line;
+        }
+        const nx = t[0] + u[0][0] * x + u[0][1] * y + u[0][2] * z;
+        const ny = t[1] + u[1][0] * x + u[1][1] * y + u[1][2] * z;
+        const nz = t[2] + u[2][0] * x + u[2][1] * y + u[2][2] * z;
+        const prefix = line.slice(0, 30);
+        const suffix = line.slice(54);
+        return `${prefix}${nx.toFixed(3).padStart(8)}${ny.toFixed(3).padStart(8)}${nz.toFixed(3).padStart(8)}${suffix}`;
+    }).join('\n');
+};
+
+const applyChainId = (pdb, chainId) => {
+    if (!pdb) {
+        return pdb;
+    }
+    const chain = (chainId && chainId.length > 0) ? chainId[0] : 'A';
+    return pdb.split('\n').map(line => {
+        if (!line.startsWith('ATOM') && !line.startsWith('HETATM')) {
+            return line;
+        }
+        const padded = line.padEnd(80, ' ');
+        return `${padded.slice(0, 21)}${chain}${padded.slice(22)}`;
+    }).join('\n');
+};
+
+const getChainIdsFromPdb = (pdb) => {
+    const chains = new Set();
+    if (!pdb) {
+        return chains;
+    }
+    const lines = pdb.split('\n');
+    for (const line of lines) {
+        const parsed = parseAtomLine(line);
+        if (!parsed) continue;
+        if (parsed.chainId && parsed.chainId.trim()) {
+            chains.add(parsed.chainId.trim());
+        }
+    }
+    return chains;
+};
+
+const buildAlignmentRanges = (alignments, kind, chainResolver) => {
+    const rangesByChain = new Map();
+    alignments.forEach((alignment, index) => {
+        const chain = chainResolver
+            ? chainResolver(alignment, index)
+            : getChainName(kind === 'query' ? alignment.query : alignment.target);
+        const start = Number(kind === 'query' ? alignment.qStartPos : alignment.dbStartPos);
+        const end = Number(kind === 'query' ? alignment.qEndPos : alignment.dbEndPos);
+        if (!Number.isFinite(start) || !Number.isFinite(end)) return;
+        if (!rangesByChain.has(chain)) {
+            rangesByChain.set(chain, []);
+        }
+        rangesByChain.get(chain).push({ start, end });
+    });
+    return rangesByChain;
+};
+
+const makeSubPdbFromRanges = (pdb, rangesByChain) => {
+    if (!pdb) {
+        return '';
+    }
+    const lines = pdb.split('\n');
+    const atomLines = lines.filter(line => line.startsWith('ATOM') || line.startsWith('HETATM'));
+    const selected = [];
+    const allRanges = [];
+    rangesByChain.forEach(ranges => {
+        ranges.forEach(range => allRanges.push(range));
+    });
+    const residueCounters = new Map();
+    const lastResidue = new Map();
+    for (const line of lines) {
+        const parsed = parseAtomLine(line);
+        if (!parsed) continue;
+        const chainKey = parsed.chainId && parsed.chainId.trim() ? parsed.chainId.trim() : '_';
+        const residueKey = `${chainKey}:${parsed.resno}:${parsed.resname}`;
+        let serialIndex = residueCounters.get(chainKey) || 0;
+        if (lastResidue.get(chainKey) !== residueKey) {
+            serialIndex += 1;
+            residueCounters.set(chainKey, serialIndex);
+            lastResidue.set(chainKey, residueKey);
+        }
+        const ranges = rangesByChain.get(parsed.chainId) || allRanges;
+        if (!ranges || ranges.length === 0) continue;
+        for (const range of ranges) {
+            if (serialIndex >= range.start && serialIndex <= range.end) {
+                selected.push(line);
+                break;
+            }
+        }
+    }
+    if (selected.length === 0) {
+        return atomLines.join('\n');
+    }
+    return selected.join('\n');
+};
 
 export default {
     name: "StructureViewer",
     components: {
-        Panel,
         StructureViewerTooltip,
         StructureViewerToolbar,
     },
@@ -146,6 +611,19 @@ export default {
             showTarget: 0,
             tmAlignResults: null,
             hasQuery: true,
+            queryData: null,
+            targetData: null,
+            lastQueryPdb: '',
+            lastTargetPdb: '',
+            queryChains: new Set(),
+            targetChains: new Set(),
+            querySerialMap: new Map(),
+            targetSerialMap: new Map(),
+            queryAlignmentChains: new Map(),
+            targetAlignmentChains: new Map(),
+            queryStructureRef: null,
+            targetStructureRef: null,
+            renderToken: 0,
         }
     },
     props: {
@@ -162,35 +640,48 @@ export default {
         autoViewTime: { type: Number, default: 100 }
     },
     methods: {
-        // Create arrows connecting CA coordinates for query/target in match columns
-        async drawArrows(str1, str2) {
-            if (!this.stage) return;
-            const shape = new Shape('arrows');
-            await Promise.all(this.alignments.map(async (alignment) => {
-                const chain_q = getChainName(alignment.query);
-                const chain_t = getChainName(alignment.target);
-                const [sele_q, sele_t] = getMatchingColumns(alignment).map(arr => arr.join(" or "));
-
-                const str1_xyz = getAtomXYZ(str1, new Selection(`(${sele_q}) and :${chain_q}.CA`));
-                const str2_xyz = getAtomXYZ(str2, new Selection(`(${sele_t}) and :${chain_t}.CA`));
-
-                if (str1_xyz.length != str2_xyz.length) {
-                    console.warn("Different number of CA atoms in query and target", str1_xyz.length, str2_xyz.length);
-                }
-                for (let i = 0; i < Math.min(str1_xyz.length, str2_xyz.length); i++) {
-                    shape.addArrow(str1_xyz[i], str2_xyz[i], [0, 1, 1], 0.4);
-                }
-            }));
-            let component = this.stage.addComponentFromObject(shape);
-            component.addRepresentation('buffer');
-            component.setVisibility(this.showArrows);
+        updateAlignmentChains() {
+            if (!this.alignments || this.alignments.length === 0) {
+                this.queryAlignmentChains = new Map();
+                this.targetAlignmentChains = new Map();
+                return;
+            }
+            this.queryAlignmentChains = assignAlignmentChains(this.alignments, (alignment) => alignment.query);
+            this.targetAlignmentChains = assignAlignmentChains(this.alignments, (alignment) => alignment.target);
+        },
+        updateQueryAlignmentChainsFromStructure() {
+            if (!this.alignments || this.alignments.length === 0) {
+                this.queryAlignmentChains = new Map();
+                return;
+            }
+            if (!this.queryChains || this.queryChains.size === 0) {
+                return;
+            }
+            this.queryAlignmentChains = assignAlignmentChains(
+                this.alignments,
+                (alignment) => alignment.query,
+                this.queryChains,
+                this.querySerialMap,
+                'qLen',
+            );
+        },
+        getAlignmentChain(kind, alignment, index) {
+            const map = kind === 'query' ? this.queryAlignmentChains : this.targetAlignmentChains;
+            if (map && map.has(index)) {
+                return map.get(index);
+            }
+            return getChainName(kind === 'query' ? alignment.query : alignment.target);
         },
         handleToggleArrows() {
-            if (!this.stage) return;
+            if (!this.stage) {
+                return;
+            }
             this.showArrows = !this.showArrows;
         },
         handleToggleQuery() {
-            if (!this.stage) return;
+            if (!this.stage) {
+                return;
+            }
             if (__LOCAL__) {
                 this.showQuery = (this.showQuery === 0) ? 1 : 0;
             } else {
@@ -198,104 +689,47 @@ export default {
             }
         },
         handleResetView() {
-            if (!this.stage) return;
-            this.setQuerySelection();
+            if (!this.stage) {
+                return;
+            }
+            this.focusSelection();
         },
         handleToggleTarget() {
-            if (!this.stage) return;
+            if (!this.stage) {
+                return;
+            }
             if (__LOCAL__) {
                 this.showTarget = (this.showTarget === 0) ? 1 : 0;
             } else {
                 this.showTarget = (this.showTarget === 2) ? 0 : this.showTarget + 1; 
             }
         },
-        clearSelection() {
-            if (!this.alignments || !this.stage) return;
-            let repr = this.stage.getRepresentationsByName("targetHighlight");
-            repr.setSelection()
-            repr.setVisibility(false)
-        },
-        setSelectionData(selection) {
-            // FIXME tube/cartoon representation cannot visualise <3 residues
-            //       https://github.com/nglviewer/ngl/issues/759
-            //       use licorice representation for this case? or just +1 to make 3
-            if (!this.alignments || !this.stage) return;
-            let repr = this.stage.getRepresentationsByName("targetHighlight");
-            repr.setSelection()
-            if (selection.length === 0) {
-                repr.setVisibility(false);
-                return;
-            }
-            let seles = [];
-            for (let [i, start, length] of selection) {
-                let chain = getChainName(this.alignments[i].target);
-                let end = start + length;
-                seles.push(`${start}-${end}:${chain}`);
-            } 
-            let sele = seles.join(" or ");
-            repr.setSelection(sele);
-            repr.setVisibility(true);
-        },
-        setQuerySelection() {
-            if (!this.stage) return;
-            let repr = this.stage.getRepresentationsByName("queryStructure");
-            if (!repr) return;
-            let sele = this.querySele;
-            repr.setSelection(sele);
-            repr.list[0].parent.autoView(sele, this.autoViewTime);
-            if (this.showQuery === 0) {
-                this.stage.getRepresentationsByName("querySurface-1").setVisibility(false);
-                this.stage.getRepresentationsByName("querySurface-2").setVisibility(false);
-            } else if (this.showQuery === 1) {
-                this.stage.getRepresentationsByName("querySurface-1").setVisibility(true);
-                this.stage.getRepresentationsByName("querySurface-2").setVisibility(false);
-            } else {
-                this.stage.getRepresentationsByName("querySurface-1").setVisibility(true);
-                this.stage.getRepresentationsByName("querySurface-2").setVisibility(true);
-            }
-        },
-        setTargetSelection() {
-            if (!this.stage) return;
-            let repr = this.stage.getRepresentationsByName("targetStructure");
-            if (!repr) return;
-            let sele = this.targetSele;
-            repr.setSelection(sele);
-        },
         async handleMakeImage() {
-            if (!this.stage)
+            if (!this.stage) {
                 return;
-            let wasSpinning = this.isSpinning;
+            }
+            const wasSpinning = this.isSpinning;
             this.isSpinning = false;
-            let title = this.alignments.map(aln => this.hasQuery ? `${aln.query}-${aln.target}` : aln.target).join("_");
-            this.stage.viewer.setLight(undefined, undefined, undefined, 0.2)
-            const blob = await this.stage.makeImage({
-                trim: true,
-                factor: (this.isFullscreen) ? 1 : 8,
-                antialias: true,
-                transparent: true,
-            });
-            this.stage.viewer.setLight(undefined, undefined, undefined, this.$vuetify.theme.dark ? 0.4 : 0.2)
-            download(blob, `${title}.png`)
+            const title = this.alignments.map(aln => this.hasQuery ? `${aln.query}-${aln.target}` : aln.target).join("_");
+            const blob = await this.stage.makeImage();
+            if (blob) {
+                downloadBlob(blob, `${title}.png`);
+            }
             this.isSpinning = wasSpinning;
         },
         handleMakePDB() {
-            if (!this.stage)
-                return;
-            let qPDB = this.stage.getComponentsByName("queryStructure").list.map(getPdbText); 
-            let tPDB = this.stage.getComponentsByName("targetStructure").list.map(getPdbText);
-            if (!qPDB && !tPDB) 
-                return;
-            let title = this.alignments.map(aln => qPDB ? `${aln.query}-${aln.target}` : aln.target);
+            const qPDB = extractAtomLines(this.lastQueryPdb);
+            const tPDB = extractAtomLines(this.lastTargetPdb);
+            if (qPDB.length === 0 && tPDB.length === 0) return;
+            const title = this.alignments.map(aln => qPDB.length > 0 ? `${aln.query}-${aln.target}` : aln.target);
             let result = null;
-            if (qPDB && tPDB) {
+            if (qPDB.length > 0 && tPDB.length > 0) {
                 result =
 `TITLE     ${title.join(" ")}
 REMARK     This file was generated by the Foldseek webserver:
 REMARK       https://search.foldseek.com
 REMARK     Please cite:
 REMARK       https://doi.org/10.1101/2022.02.07.479398
-REMARK     Warning: Non C-alpha atoms might have been re-generated by PULCHRA,
-REMARK              if they are not present in the original PDB file.
 MODEL        1
 ${qPDB.join('\n')}
 ENDMDL
@@ -311,38 +745,477 @@ REMARK     This file was generated by the Foldseek webserver:
 REMARK       https://search.foldseek.com
 REMARK     Please cite:
 REMARK       https://doi.org/10.1101/2022.02.07.479398
-REMARK     Warning: Non C-alpha atoms were re-generated by PULCHRA.
 MODEL        1
 ${tPDB.join('\n')}
 ENDMDL
 END
 `
             }
-            download(new Blob([result], { type: 'text/plain' }), (title.join("_") + ".pdb"));
-        }
+            downloadBlob(new Blob([result], { type: 'text/plain' }), (title.join("_") + ".pdb"));
+        },
+        buildSelectionExpression(kind, mode) {
+            if (!this.alignments || this.alignments.length === 0) {
+                return MS.struct.generator.all();
+            }
+            if (mode === 2) {
+                return MS.struct.generator.all();
+            }
+            const useRanges = mode === 0;
+            const chainSet = kind === 'query' ? this.queryChains : this.targetChains;
+            const serialMap = kind === 'query' ? this.querySerialMap : this.targetSerialMap;
+            const rangesByChain = new Map();
+            this.alignments.forEach((alignment, index) => {
+                const chainName = this.getAlignmentChain(kind, alignment, index);
+                if (!rangesByChain.has(chainName)) {
+                    rangesByChain.set(chainName, []);
+                }
+                if (useRanges) {
+                    const start = Number(kind === 'query' ? alignment.qStartPos : alignment.dbStartPos);
+                    const end = Number(kind === 'query' ? alignment.qEndPos : alignment.dbEndPos);
+                    if (Number.isFinite(start) && Number.isFinite(end)) {
+                        rangesByChain.get(chainName).push({ start, end });
+                    }
+                }
+            });
+            const chainExpressions = [];
+            rangesByChain.forEach((ranges, chain) => {
+                let mappedRanges = ranges;
+                if (useRanges) {
+                    let chainMap = serialMap.get(chain);
+                    if (!chainMap && serialMap.size === 1) {
+                        chainMap = Array.from(serialMap.values())[0];
+                    }
+                    mappedRanges = mapRangesToAuth(ranges, chainMap);
+                }
+                const useChain = chainSet && chainSet.size > 0 && chainSet.has(chain);
+                chainExpressions.push(buildChainExpression(chain, useRanges ? mappedRanges : null, useChain));
+            });
+            if (chainExpressions.length === 0) {
+                return MS.struct.generator.all();
+            }
+            return chainExpressions.length === 1
+                ? chainExpressions[0]
+                : MS.struct.combinator.merge(chainExpressions);
+        },
+        buildAlignedPairs(maxPairs = MAX_ARROW_PAIRS) {
+            const pairs = [];
+            if (!this.alignments || this.alignments.length === 0) {
+                return pairs;
+            }
+            this.alignments.forEach((alignment, index) => {
+                const qAln = alignment.qAln || '';
+                const tAln = alignment.dbAln || alignment.tAln || '';
+                if (!qAln || !tAln) {
+                    return;
+                }
+                let qPos = Number(alignment.qStartPos);
+                let tPos = Number(alignment.dbStartPos);
+                if (!Number.isFinite(qPos) || !Number.isFinite(tPos)) {
+                    return;
+                }
+                const qChain = this.getAlignmentChain('query', alignment, index);
+                const tChain = this.getAlignmentChain('target', alignment, index);
+                const len = Math.min(qAln.length, tAln.length);
+                for (let i = 0; i < len; i += 1) {
+                    const qChar = qAln[i];
+                    const tChar = tAln[i];
+                    const qGap = qChar === '-';
+                    const tGap = tChar === '-';
+                    if (!qGap && !tGap) {
+                        pairs.push({ qChain, tChain, qPos, tPos });
+                    }
+                    if (!qGap) {
+                        qPos += 1;
+                    }
+                    if (!tGap) {
+                        tPos += 1;
+                    }
+                }
+            });
+            if (!maxPairs || pairs.length <= maxPairs) {
+                return pairs;
+            }
+            const stride = Math.ceil(pairs.length / maxPairs);
+            const sampled = [];
+            for (let i = 0; i < pairs.length; i += stride) {
+                sampled.push(pairs[i]);
+            }
+            return sampled;
+        },
+        getMappedResno(kind, chain, serialPos) {
+            const serialMap = kind === 'query' ? this.querySerialMap : this.targetSerialMap;
+            let chainMap = serialMap.get(chain);
+            if (!chainMap && serialMap.size === 1) {
+                chainMap = Array.from(serialMap.values())[0];
+            }
+            return mapSerialPosition(serialPos, chainMap);
+        },
+        getResidueLoci(structureRef, chain, resno, chainSet) {
+            if (!structureRef || !Number.isFinite(resno)) {
+                return null;
+            }
+            const useChain = chainSet && chainSet.size > 0 && chainSet.has(chain);
+            const expr = buildResidueAtomExpression(chain, resno, useChain, 'CA');
+            return getSelectionLociSafe(expr, structureRef);
+        },
+        async renderArrows() {
+            if (!this.stage || !this.showArrows) {
+                return;
+            }
+            if (!this.queryStructureRef || !this.targetStructureRef) {
+                return;
+            }
+            const pairs = this.buildAlignedPairs(MAX_ARROW_PAIRS);
+            console.log(pairs);
+            if (pairs.length === 0) {
+                return;
+            }
+            const arrowColor = toMolstarColor(DEFAULT_ARROW_COLOR, DEFAULT_ARROW_COLOR);
+            const arrowParams = {
+                visualParams: { visuals: ['lines'] },
+                lineParams: {
+                    linesColor: arrowColor,
+                    linesSize: 0.05,
+                    dashLength: 0.2,
+                },
+            };
+            for (const pair of pairs) {
+                debugger;
+                const qResno = this.getMappedResno('query', pair.qChain, pair.qPos);
+                const tResno = this.getMappedResno('target', pair.tChain, pair.tPos);
+                console.log(this.queryChains, this.targetChains)
+                const qLoci = this.getResidueLoci(this.queryStructureRef, pair.qChain, qResno, this.queryChains);
+                const tLoci = this.getResidueLoci(this.targetStructureRef, pair.tChain, tResno, this.targetChains);
+                if (!qLoci || !tLoci) {
+                    continue;
+                }
+                await this.stage.addDistance(qLoci, tLoci, arrowParams);
+            }
+        },
+        buildHighlightExpression() {
+            if (!Array.isArray(this.highlights) || this.highlights.length === 0) {
+                return null;
+            }
+            const chainSet = this.targetChains;
+            const expressions = [];
+            this.highlights.forEach((highlight, index) => {
+                if (!highlight || highlight.length < 2) return;
+                const start = Number(highlight[0]);
+                const length = Number(highlight[1]);
+                if (!Number.isFinite(start) || !Number.isFinite(length) || length <= 0) return;
+                const alignment = this.alignments[index];
+                if (!alignment) return;
+                const chain = this.getAlignmentChain('target', alignment, index);
+                let chainMap = this.targetSerialMap.get(chain);
+                if (!chainMap && this.targetSerialMap.size === 1) {
+                    chainMap = Array.from(this.targetSerialMap.values())[0];
+                }
+                const mappedRanges = mapRangesToAuth([{ start, end: start + length - 1 }], chainMap);
+                if (!mappedRanges || mappedRanges.length === 0) return;
+                const useChain = chainSet && chainSet.size > 0 && chainSet.has(chain);
+                expressions.push(buildChainExpression(chain, mappedRanges, useChain));
+            });
+            if (expressions.length === 0) return null;
+            return expressions.length === 1
+                ? expressions[0]
+                : MS.struct.combinator.merge(expressions);
+        },
+        focusSelection() {
+            if (!this.stage) return;
+            const selectionTarget = this.queryStructureRef || this.targetStructureRef;
+            if (!selectionTarget) {
+                this.stage.focusLoci(null, this.autoViewTime);
+                return;
+            }
+            const expr = this.queryStructureRef
+                ? this.buildSelectionExpression('query', this.showQuery)
+                : this.buildSelectionExpression('target', this.showTarget);
+            const loci = getSelectionLoci(expr, selectionTarget);
+            this.stage.focusLoci(loci, this.autoViewTime);
+        },
+        async loadStructureData() {
+            if (!this.alignments || this.alignments.length === 0) {
+                return;
+            }
+
+            this.updateAlignmentChains();
+            this.queryData = null;
+            this.targetData = null;
+            this.lastQueryPdb = '';
+            this.lastTargetPdb = '';
+            this.hasQuery = true;
+            this.tmAlignResults = null;
+
+            let queryPdb = "";
+            if (this.$LOCAL) {
+                if (this.hits.queries[0].hasOwnProperty('pdb')) {
+                    queryPdb = JSON.parse(this.hits.queries[0].pdb);
+                } else {
+                    queryPdb = mockPDB(this.hits.queries[0].qCa, this.hits.queries[0].sequence, 'A');
+                }
+            } else if (this.$route.params.ticket.startsWith('user-')) {
+                if (this.hits.queries[0].hasOwnProperty('pdb')) {
+                    queryPdb = JSON.parse(this.hits.queries[0].pdb);
+                } else {
+                    const localData = this.$root.userData[this.$route.params.entry];
+                    queryPdb = mockPDB(localData.queries[0].qCa, localData.queries[0].sequence, 'A');
+                }
+            } else {
+                try {
+                    const request = await this.$axios.get("api/result/" + this.$route.params.ticket + '/query');
+                    queryPdb = request.data;
+                } catch (e) {
+                    queryPdb = "";
+                    this.hasQuery = false;
+                }
+            }
+
+            if (queryPdb) {
+                const trimmed = queryPdb.trimStart();
+                const format = (trimmed.startsWith('#') || trimmed.startsWith('data_')) ? 'mmcif' : 'pdb';
+                this.queryData = { data: queryPdb, format, label: 'query' };
+                this.lastQueryPdb = queryPdb;
+                const parsed = await readQueryDataWithMolIo(queryPdb, format);
+                if (parsed) {
+                    this.queryChains = parsed.chainIds;
+                    this.querySerialMap = parsed.serialMap;
+                    this.updateQueryAlignmentChainsFromStructure();
+                } else {
+                    this.queryChains = new Set();
+                    this.querySerialMap = new Map();
+                }
+            } else {
+                this.hasQuery = false;
+                this.queryChains = new Set();
+                this.querySerialMap = new Map();
+            }
+
+            const targets = [];
+            let lastIdx = null;
+            let remoteData = null;
+            let i = 0;
+            for (let idx = 0; idx < this.alignments.length; idx += 1) {
+                const alignment = this.alignments[idx];
+                const chain = this.getAlignmentChain('target', alignment, idx);
+                let tSeq = alignment.tSeq;
+                let tCa = alignment.tCa;
+                if (Number.isInteger(alignment.tCa) && Number.isInteger(alignment.tSeq)) {
+                    const db = alignment.db;
+                    const remoteIdx = alignment.tCa;
+                    if (remoteIdx != lastIdx) {
+                        const ticket =  this.$route.params.ticket;
+                        const response = await this.$axios.get("api/result/" + ticket + '/' + this.$route.params.entry + '?format=brief&index=' + remoteIdx + '&database=' + db);
+                        remoteData = response.data;
+                        lastIdx = remoteIdx;
+                    }
+                    // console.log("remoteData", remoteData, lastIdx)
+                    if (Array.isArray(remoteData) && remoteData.length > 0) {
+                        tSeq = remoteData[i].tSeq;
+                        tCa = remoteData[i].tCa;
+                        i++;
+                    } else {
+                        tSeq = null;
+                        tCa = null;
+                    }
+                }
+                // console.log(tSeq, tCa)
+                if (!tSeq || !tCa) {
+                    continue;
+                }
+                const mock = mockPDB(tCa, tSeq, chain);
+                try {
+                    const pdb = await pulchra(mock);
+                    targets.push(applyChainId(pdb, chain));
+                } catch (error) {
+                    console.warn('pulchra failed for target chain', chain, error);
+                    targets.push(applyChainId(mock, chain));
+                }
+            }
+            let targetPdb = mergePdbChunks(targets);
+            if (this.alignments[0]?.complexu && this.alignments[0]?.complext) {
+                const t = this.alignments[0].complext.split(',').map(x => parseFloat(x));
+                const uFlat = this.alignments[0].complexu.split(',').map(x => parseFloat(x));
+                const u = [
+                    [uFlat[0], uFlat[1], uFlat[2]],
+                    [uFlat[3], uFlat[4], uFlat[5]],
+                    [uFlat[6], uFlat[7], uFlat[8]],
+                ];
+                targetPdb = transformPdb(targetPdb, t, u);
+            }
+            if (targetPdb) {
+                this.targetChains = getChainIdsFromPdb(targetPdb);
+                this.targetSerialMap = buildSerialResidueMap(targetPdb);
+                if (this.hasQuery && this.queryData && !this.alignments[0]?.complexu) {
+                    if (this.queryData.format === 'pdb') {
+                        try {
+                            const alnFasta = `>target\n${this.alignments[0].dbAln}\n\n>query\n${this.alignments[0].qAln}`;
+                            const tRanges = buildAlignmentRanges(this.alignments, 'target', (alignment, index) => this.getAlignmentChain('target', alignment, index));
+                            const qRanges = buildAlignmentRanges(this.alignments, 'query', (alignment, index) => this.getAlignmentChain('query', alignment, index));
+                            const tSubPdb = makeSubPdbFromRanges(targetPdb, tRanges);
+                            const qSubPdb = makeSubPdbFromRanges(this.lastQueryPdb, qRanges);
+                            // console.log(targetPdb)
+                            // console.log(this.lastQueryPdb)
+                            // console.log("target", tRanges, targetPdb)
+                            // console.log("query", qRanges, this.lastQueryPdb)
+                            const tm = await tmalign(tSubPdb, qSubPdb, alnFasta);
+                            this.tmAlignResults = parseTMOutput(tm.output);
+                            const { t, u } = parseTMMatrix(tm.matrix);
+                            targetPdb = transformPdb(targetPdb, t, u);
+                        } catch (error) {
+                            console.warn('tmalign-wasm failed, using unaligned target', error);
+                        }
+                    } else {
+                        console.warn('Skipping TM-align: query structure is not PDB');
+                    }
+                }
+                this.targetData = { data: targetPdb, format: 'pdb', label: 'target' };
+                this.lastTargetPdb = targetPdb;
+            }
+        },
+        async renderStructures(focus = true) {
+            if (!this.stage || !this.stageReady) {
+                return;
+            }
+            const token = ++this.renderToken;
+            await this.stageReady;
+            if (token !== this.renderToken) {
+                return;
+            }
+
+            await this.stage.clear();
+            this.queryStructureRef = null;
+            this.targetStructureRef = null;
+
+            const queryAlignedColor = toMolstarColor(this.queryAlignedColor, DEFAULT_QUERY_COLOR);
+            const queryUnalignedColor = toMolstarColor(this.queryUnalignedColor, DEFAULT_QUERY_UNALIGNED_COLOR);
+            const targetAlignedColor = toMolstarColor(this.targetAlignedColor, DEFAULT_TARGET_COLOR);
+            const targetUnalignedColor = toMolstarColor(this.targetUnalignedColor, DEFAULT_TARGET_UNALIGNED_COLOR);
+            const highlightColor = toMolstarColor(DEFAULT_HIGHLIGHT_COLOR, DEFAULT_HIGHLIGHT_COLOR);
+
+            if (this.targetData) {
+                const targetStructure = await this.stage.loadStructure(this.targetData);
+                this.targetStructureRef = targetStructure;
+                const alignedExpr = this.buildSelectionExpression('target', 0);
+                if (this.showTarget === 0) {
+                    const alignedComponent = await this.stage.createComponentFromExpression(targetStructure, alignedExpr, `target-aligned-${token}`);
+                    if (alignedComponent) {
+                        await this.stage.addRepresentation(alignedComponent, {
+                            type: 'cartoon',
+                            color: 'uniform',
+                            colorParams: { value: targetAlignedColor },
+                        });
+                    }
+                } else {
+                    const fullExpr = (this.showTarget === 2)
+                        ? MS.struct.generator.all()
+                        : this.buildSelectionExpression('target', 1);
+                    const unalignedExpr = MS.struct.modifier.exceptBy({ 0: fullExpr, by: alignedExpr });
+                    const unalignedComponent = await this.stage.createComponentFromExpression(targetStructure, unalignedExpr, `target-unaligned-${token}`);
+                    if (unalignedComponent) {
+                        await this.stage.addRepresentation(unalignedComponent, {
+                            type: 'cartoon',
+                            color: 'uniform',
+                            colorParams: { value: targetUnalignedColor },
+                        });
+                    }
+                    const alignedComponent = await this.stage.createComponentFromExpression(targetStructure, alignedExpr, `target-aligned-${token}`);
+                    if (alignedComponent) {
+                        await this.stage.addRepresentation(alignedComponent, {
+                            type: 'cartoon',
+                            color: 'uniform',
+                            colorParams: { value: targetAlignedColor },
+                        });
+                    }
+                }
+            }
+
+            if (this.queryData) {
+                const queryStructure = await this.stage.loadStructure(this.queryData);
+                this.queryStructureRef = queryStructure;
+                const alignedExpr = this.buildSelectionExpression('query', 0);
+                if (this.showQuery === 0) {
+                    const alignedComponent = await this.stage.createComponentFromExpression(queryStructure, alignedExpr, `query-aligned-${token}`);
+                    if (alignedComponent) {
+                        await this.stage.addRepresentation(alignedComponent, {
+                            type: 'cartoon',
+                            color: 'uniform',
+                            colorParams: { value: queryAlignedColor },
+                        });
+                    }
+                } else {
+                    const fullExpr = (this.showQuery === 2)
+                        ? MS.struct.generator.all()
+                        : this.buildSelectionExpression('query', 1);
+                    const unalignedExpr = MS.struct.modifier.exceptBy({ 0: fullExpr, by: alignedExpr });
+                    const unalignedComponent = await this.stage.createComponentFromExpression(queryStructure, unalignedExpr, `query-unaligned-${token}`);
+                    if (unalignedComponent) {
+                        await this.stage.addRepresentation(unalignedComponent, {
+                            type: 'cartoon',
+                            color: 'uniform',
+                            colorParams: { value: queryUnalignedColor },
+                        });
+                    }
+                    const alignedComponent = await this.stage.createComponentFromExpression(queryStructure, alignedExpr, `query-aligned-${token}`);
+                    if (alignedComponent) {
+                        await this.stage.addRepresentation(alignedComponent, {
+                            type: 'cartoon',
+                            color: 'uniform',
+                            colorParams: { value: queryAlignedColor },
+                        });
+                    }
+                }
+            }
+
+            if (this.targetStructureRef) {
+                const highlightExpr = this.buildHighlightExpression();
+                if (highlightExpr) {
+                    const highlightComponent = await this.stage.createComponentFromExpression(this.targetStructureRef, highlightExpr, `target-highlight-${token}`);
+                    if (highlightComponent) {
+                        await this.stage.addRepresentation(highlightComponent, {
+                            type: 'ball-and-stick',
+                            color: 'uniform',
+                            colorParams: { value: highlightColor },
+                        });
+                    }
+                }
+            }
+
+            await this.renderArrows();
+
+            const focusRef = this.queryStructureRef || this.targetStructureRef;
+            if (focus) {
+                const loci = getSelectionLoci(focusRef ? MS.struct.generator.all() : null, focusRef);
+                this.stage.focusLoci(loci, this.autoViewTime);
+            }
+        },
     },
     watch: {
-        'showArrows': function(val, _) {
-            if (!this.stage) return
-            this.stage.getComponentsByName("arrows").forEach(comp => { comp.setVisibility(val) });
-        },
         'showQuery': function() {
-            if (!this.stage) return;
-            this.setQuerySelection();
+            if (!this.stage) {
+                return;
+            }
+            this.renderStructures(true);
         },
         'showTarget': function(val, _) {
-            if (!this.stage) return;
-            this.setTargetSelection();
+            if (!this.stage) {
+                return;
+            }
+            this.renderStructures(true);
         },
-        'highlights': function(values) {
-            if (!this.stage || !values) return;
-            let selections = []
-            values.forEach((value, i) => {
-                if (!value) return;
-                let [start, length] = value;
-                selections.push([i, start, length]);
-            })
-            this.setSelectionData(selections)
+        'showArrows': function() {
+            if (!this.stage) {
+                return;
+            }
+            this.renderStructures(false);
+        },
+        'highlights': {
+            deep: true,
+            handler() {
+                if (!this.stage) {
+                    return;
+                }
+                this.renderStructures(false);
+            },
         }
     },
     computed: {
@@ -350,226 +1223,32 @@ END
             if (this.alignments.length === 0 || this.showQuery == 2)
                 return '';
             if (this.showQuery === 0)
-                return this.alignments.map(a => `${a.qStartPos}-${a.qEndPos}:${getChainName(a.query)}`).join(" or ");
+                return this.alignments.map((a, index) => `${a.qStartPos}-${a.qEndPos}:${this.getAlignmentChain('query', a, index)}`).join(" or ");
             if (this.showQuery === 1)
-                return this.alignments.map(a => `:${getChainName(a.query)}`).join(" or ");
+                return this.alignments.map((a, index) => `:${this.getAlignmentChain('query', a, index)}`).join(" or ");
         },
         targetSele: function() {
             if (this.alignments.length === 0 || this.showTarget == 2)
                 return '';
             if (this.showTarget === 0)
-                return this.alignments.map(a => `${a.dbStartPos}-${a.dbEndPos}:${getChainName(a.target)}`).join(" or ");
+                return this.alignments.map((a, index) => `${a.dbStartPos}-${a.dbEndPos}:${this.getAlignmentChain('target', a, index)}`).join(" or ");
             if (this.showTarget === 1)
-                return this.alignments.map(a => `:${getChainName(a.target)}`).join(" or ");
+                return this.alignments.map((a, index) => `:${this.getAlignmentChain('target', a, index)}`).join(" or ");
         },
         tmPanelBindings: function() {
-            return (this.isFullscreen) ? { 'style': 'margin-top: 10px; font-size: 2em; line-height: 2em' } : {  }
+            return (this.isFullscreen) ? { 'style': 'margin-top: 10px; font-size: 2em; line-height: 2em' } : { }
         },
     },
     async mounted() {
-        if (typeof(this.alignments[0].tCa) == "undefined")
+        if (!this.alignments || this.alignments.length === 0) {
             return;
-
-        // Download from server --> full input PDB from /result/query endpoint, saved with JSON.stringify
-        //                local --> qCa string
-        // Tickets prefixed with 'user-' only occur on user uploaded files
-        let queryPdb = "";
-        this.hasQuery = true;
-        if (this.$LOCAL) {
-            if (this.hits.queries[0].hasOwnProperty('pdb')) {
-                queryPdb = JSON.parse(this.hits.queries[0].pdb);
-            } else {
-                queryPdb = mockPDB(this.hits.queries[0].qCa, this.hits.queries[0].sequence, 'A');
-            }
-        } else if (this.$route.params.ticket.startsWith('user-')) {
-            // Check for special 'user' ticket for when users have uploaded JSON
-            if (this.hits.queries[0].hasOwnProperty('pdb')) {
-                queryPdb = JSON.parse(this.hits.queries[0].pdb);
-            } else {
-                const localData = this.$root.userData[this.$route.params.entry];
-                queryPdb = mockPDB(localData.queries[0].qCa, localData.queries[0].sequence, 'A');
-            }
-        } else {
-            try {
-                const request = await this.$axios.get("api/result/" + this.$route.params.ticket + '/query');
-                queryPdb = request.data;
-            } catch (e) {
-                queryPdb = "";
-                this.hasQuery = false;
-            }
         }
-
-        // Run PULCHRA per chain then concatenate Structure objects in first StructureComponent
-        const targets = [];
-        const selections_t = [];
-        let renumber = 0;
-        let lastIdx = null;
-        let remoteData = null;
-        let i = 0;
-        // It is wrapped in order to make it handle when it is destroyed even before it is fully mounted
-        try {
-            for (let alignment of this.alignments) {
-                const chain = getChainName(alignment.target);
-                let tSeq = alignment.tSeq;
-                let tCa = alignment.tCa;
-                if (Number.isInteger(alignment.tCa) && Number.isInteger(alignment.tSeq)) {
-                    const db = alignment.db;
-                    const idx = alignment.tCa;
-                    if (idx != lastIdx) {
-                        const ticket =  this.$route.params.ticket;
-                        const response = await this.$axios.get("api/result/" + ticket + '/' + this.$route.params.entry + '?format=brief&index=' + idx + '&database=' + db);
-                        remoteData = response.data;
-                        lastIdx = idx;
-                    }
-                    tSeq = remoteData[i].tSeq;
-                    tCa = remoteData[i].tCa;
-                    i++;
-                }
-                const mock = mockPDB(tCa, tSeq, chain);
-                const pdb = await pulchra(mock);
-                const component = await this.stage.loadFile(new Blob([pdb], { type: 'text/plain' }), {ext: 'pdb', firstModelOnly: true});
-                component.structure.eachChain(c => { c.chainname = chain; });
-                component.structure.eachAtom(a => { a.serial = renumber++; });
-                targets.push(component);
-                selections_t.push(`${alignment.dbStartPos}-${alignment.dbEndPos}:${chain}`);
-            }
-        } catch (e) {
-            return 
+        if (typeof(this.alignments[0].tCa) == "undefined") {
+            return;
         }
-        const structure = concatStructures(getAccession(this.alignments[0].target), ...targets.map(t => t.structure));
-        const target = this.stage.addComponentFromObject(structure, { name: "targetStructure" });
-        
-        target.addRepresentation('tube', {
-            color: 0x11FFEE,
-            side: 'front',
-            opacity: 0.5,
-            radius: 0.8,
-            visible: false,
-            name: 'targetHighlight'
-        });
-
-        if (ColormakerRegistry.hasScheme("_targetScheme")) {
-            ColormakerRegistry.removeScheme("_targetScheme")
-        }
-        this.targetSchemeId = ColormakerRegistry.addSelectionScheme([
-            [this.targetAlignedColor, selections_t.join(" or ")],
-            [this.targetUnalignedColor, "*"]
-        ], "_targetScheme")
-
-        if (this.hasQuery) {
-            let data = '';
-            let ext = 'pdb';
-            queryPdb = queryPdb.trimStart();
-            if (queryPdb[0] == "#" || queryPdb.startsWith("data_")) {
-                ext = 'cif';
-                // NGL doesn't like AF3's _chem_comp entries
-                queryPdb = queryPdb.replaceAll("_chem_comp.", "_chem_comp_SKIP_HACK.");
-            } else {
-                for (let line of queryPdb.split('\n')) {
-                    let numCols = Math.max(0, 80 - line.length);
-                    let newLine = line + ' '.repeat(numCols) + '\n';
-                    data += newLine
-                }
-                queryPdb = data;
-            }
-
-            let query = await this.stage.loadFile(new Blob([queryPdb], { type: 'text/plain' }), { ext: ext, firstModelOnly: true, name: 'queryStructure'});
-            if (query && query.structure.getAtomProxy().isCg()) {
-                if (ext == "cif") {
-                    // FIXME: pulchra probably should learn mmCIF
-                    queryPdb = getPdbText(query);
-                }
-                // As pulchra loses the chain information, it could result in mismatch between selection and pulchra-generated pdb
-                // So we should store chain information of pdb structure information and recover it
-                const chains = storeChains(queryPdb)
-                queryPdb = await pulchra(queryPdb);
-                queryPdb = revertChainInfo(queryPdb, chains)
-                this.stage.removeComponent(query);
-                query = await this.stage.loadFile(new Blob([queryPdb], { type: 'text/plain' }), {ext: 'pdb', firstModelOnly: true, name: 'queryStructure'}); 
-            }
-
-            // Map 1-based indices to residue index/resno; only need for query structure
-            // Use queryChainSele to make all selections based on actual query chain
-            const selections_q = [];
-            for (let alignment of this.alignments) {
-                const chain = getChainName(alignment.query);
-
-                selections_q.push(`${alignment.qStartPos}-${alignment.qEndPos} and :${chain}`);
-
-                // Renumber to avoid residue gaps
-                let renumber = 1;
-                query.structure.eachResidue(function(rp) {
-                    rp.resno = renumber++;
-                }, new Selection(`:${chain}`))
-            }
-            if (ColormakerRegistry.hasScheme("_queryScheme")) {
-                ColormakerRegistry.removeScheme("_queryScheme")
-            }
-            this.querySchemeId = ColormakerRegistry.addSelectionScheme([
-                [this.queryAlignedColor, selections_q.join(" or ")],
-                [this.queryUnalignedColor, "*"],
-            ], "_queryScheme")
-
-            // Re-align target to query using TM-align for better superposition
-            // Target 1st since TM-align generates superposition matrix for 1st structure
-            if (this.alignments[0].hasOwnProperty("complexu") && this.alignments[0].hasOwnProperty("complext")) {
-                const t = this.alignments[0].complext.split(',').map(x => parseFloat(x));
-                let u = this.alignments[0].complexu.split(',').map(x => parseFloat(x));
-                u = [
-                    [u[0], u[1], u[2]],
-                    [u[3], u[4], u[5]],
-                    [u[6], u[7], u[8]],
-                ];
-                // Can't use setTransform since we need the actual transformed coordinates for arrows
-                transformStructure(target.structure, t, u);
-                query.addRepresentation(this.qRepr, { color: this.querySchemeId, smoothSheet: true, name: "queryStructure"});
-                target.addRepresentation(this.tRepr, { color: this.targetSchemeId, smoothSheet: true, name: "targetStructure" });
-
-                // Make three separate surface representations based on query toggle state:
-                //   0: Aligned regions of aligned chains
-                //   1: Unaligned regions of aligned chains (shown with 0)
-                //   2: Full structure (all chains; shown with 0 and 1)
-                // Then toggle visibility when showQuery is changed by the user.
-                const surfaceSele0 = [];
-                const surfaceSele1 = [];
-                const surfaceSele2 = [];
-                for (let alignment of this.alignments) {
-                    let chain = getChainName(alignment.query);
-                    surfaceSele0.push(`${alignment.qStartPos}-${alignment.qEndPos}:${chain}`);
-                    surfaceSele1.push(`(not ${alignment.qStartPos}-${alignment.qEndPos} and :${chain})`);
-                    surfaceSele2.push(`:${chain}`);
-                }
-                const surfaceParams = {
-                    color: colorblindColors,
-                    opacity: 0.1,
-                    opaqueBack: false,
-                    useWorker: false
-                }
-                query.addRepresentation("surface", { sele: surfaceSele0.join(" or "), name: "querySurface-0", ...surfaceParams });
-                query.addRepresentation("surface", { sele: surfaceSele1.join(" or "), name: "querySurface-1", visible: false, ...surfaceParams });
-                query.addRepresentation("surface", { sele: `not (${surfaceSele2.join(" or ")})`, name: "querySurface-2", visible: false, ...surfaceParams });
-            } else {
-                // Generate subsetted PDBs for TM-align
-                let qSubPdb = makeSubPDB(query.structure, this.querySele);
-                let tSubPdb = makeSubPDB(target.structure, this.targetSele);
-                let alnFasta = `>target\n${this.alignments[0].dbAln}\n\n>query\n${this.alignments[0].qAln}`
-                const tm = await tmalign(tSubPdb, qSubPdb, alnFasta);
-                this.tmAlignResults = parseTMOutput(tm.output)
-                let { t, u } = parseTMMatrix(tm.matrix)
-                transformStructure(target.structure, t, u)
-                query.addRepresentation(this.qRepr, {color: this.querySchemeId, name: "queryStructure"});
-                target.addRepresentation(this.tRepr, {color: this.targetSchemeId, name: "targetStructure"});
-            }
-            await this.drawArrows(query.structure, target.structure)
-            this.setQuerySelection();
-            this.setTargetSelection();
-            query.autoView(this.querySele, this.autoViewTime)
-        } else {
-            target.addRepresentation(this.tRepr, {color: this.targetSchemeId, name: "targetStructure"})
-            this.setTargetSelection();
-            this.stage.autoView(this.autoViewTime)
-        }
-        
+        await this.stageReady;
+        await this.loadStructureData();
+        await this.renderStructures();
     },
 }
 </script>

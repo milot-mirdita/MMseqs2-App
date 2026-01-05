@@ -182,7 +182,7 @@ import { StorageWrapper, HistoryMixin } from './lib/HistoryMixin.js';
 import { BlobDatabase } from './lib/BlobDatabase.js';
 import Databases from './Databases.vue';
 import QueryTextarea from "./QueryTextarea.vue";
-import {autoLoad} from 'ngl';
+// import {autoLoad} from 'ngl';
 import MotifSelection from "./MotifSelection.vue";
 import LigandMotifSelection from "./LigandMotifSelection.vue";
 
