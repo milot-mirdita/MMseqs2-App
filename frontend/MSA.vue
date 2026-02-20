@@ -760,8 +760,10 @@ export default {
             }
             this.$emit('changedSelection', this.selectedColumns)
             this.$refs.msaView.addHighlightColumn(idx, move && this.showViewer)
-            this.$refs.structViewer.updateAllHighlights()
-            this.$refs.structViewer.moveView(idx)
+            const viewer = this.$refs.structViewer
+            if (!viewer) return
+            viewer.updateAllHighlights()
+            viewer.moveView(idx)
         },
         spliceActiveIndex(idx) {
             let i = this.selectedColumns.indexOf(idx)
@@ -773,7 +775,9 @@ export default {
             this.selectedColumns.splice(i, 1)
             this.$emit('changedSelection', this.selectedColumns)
             this.$refs.msaView.removeHighlightColumn(idx)
-            this.$refs.structViewer.updateAllHighlights()
+            const viewer = this.$refs.structViewer
+            if (!viewer) return
+            viewer.updateAllHighlights()
         },
         changePreview(idx, fromStruct=false) {
             if (idx < 0) {
@@ -781,7 +785,9 @@ export default {
                     this.previewColumn = -1
                     this.$nextTick(() => {
                         setTimeout(()=> {
-                            this.$refs.structViewer.updateAllPreview()
+                            const viewer = this.$refs.structViewer
+                            if (!viewer) return
+                            viewer.updateAllPreview()
                         })
                     })
 
@@ -796,14 +802,18 @@ export default {
                     this.$refs.msaView.activateColumn(idx, true, true && this.showViewerCondition)
                     this.$nextTick(() => {
                         setTimeout(()=>{
-                            this.$refs.structViewer.updateAllPreview()
+                            const viewer = this.$refs.structViewer
+                            if (!viewer) return
+                            viewer.updateAllPreview()
                         })
                     })
                 } else {
                     this.$nextTick(() => {
                         setTimeout(()=>{
-                            this.$refs.structViewer.updateAllPreview()
-                            this.$refs.structViewer.moveView(Number(idx))
+                            const viewer = this.$refs.structViewer
+                            if (!viewer) return
+                            viewer.updateAllPreview()
+                            viewer.moveView(Number(idx))
                         })
                     })
                 }
@@ -814,8 +824,10 @@ export default {
             this.selectedColumns.splice(0)
             this.$emit('changedSelection', this.selectedColumns)
             this.$refs.msaView.clearHighlightColumns()
-            this.$refs.structViewer.updateAllHighlights()
-            this.$refs.structViewer.resetView()
+            const viewer = this.$refs.structViewer
+            if (!viewer) return
+            viewer.updateAllHighlights()
+            viewer.resetView()
         },
     },
 }

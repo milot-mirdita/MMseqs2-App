@@ -369,6 +369,8 @@ export default {
         selection: { type: Array, required: true, default: [0, 1] },
         mask: { type: Array, required: true },
         reference: { type: Number, required: true },
+        selectedColumns: { type: Array, default: () => [] },
+        previewColumn: { type: Number, default: -1 },
         bgColorLight: { type: String, default: "white" },
         bgColorDark: { type: String, default: "#1E1E1E" },
         representationStyle: { type: String, default: "cartoon" },
@@ -444,6 +446,7 @@ ENDMDL
             if (!StructureElement.Loci.is(loci)) {
                 this.selectedColumn = -1;
                 this.$emit('columnSelected', -1);
+                this.$emit('changePreview', -1, true);
                 this.renderOverlays();
                 return;
             }
@@ -451,6 +454,7 @@ ENDMDL
             if (!location) {
                 this.selectedColumn = -1;
                 this.$emit('columnSelected', -1);
+                this.$emit('changePreview', -1, true);
                 this.renderOverlays();
                 return;
             }
@@ -466,12 +470,14 @@ ENDMDL
             if (!Number.isFinite(serialIndex)) {
                 this.selectedColumn = -1;
                 this.$emit('columnSelected', -1);
+                this.$emit('changePreview', -1, true);
                 this.renderOverlays();
                 return;
             }
             const alnPos = getAlignmentPos(this.entries[index].aa, serialIndex);
             this.selectedColumn = alnPos;
             this.$emit('columnSelected', alnPos);
+            this.$emit('changePreview', alnPos, true);
             this.renderOverlays();
         },
         focusReference() {
@@ -518,16 +524,35 @@ ENDMDL
             const useChain = item.chainIds && item.chainIds.size > 0 && item.chainIds.has(chain);
             return buildChainExpression(chain, mappedRanges, useChain);
         },
-        buildHighlightExpression(entry, item) {
-            if (this.selectedColumn < 0) return null;
-            const residueIndex = getResidueIndex(entry.aa, this.selectedColumn);
-            if (!Number.isFinite(residueIndex) || residueIndex < 0) return null;
+        buildColumnsExpression(entry, item, columns) {
+            if (!Array.isArray(columns) || columns.length === 0) return null;
+            const residueIndices = Array.from(new Set(columns
+                .map(col => getResidueIndex(entry.aa, Number(col)))
+                .filter(resIdx => Number.isFinite(resIdx) && resIdx >= 0)))
+                .sort((a, b) => a - b);
+            if (residueIndices.length === 0) return null;
+            const ranges = positionsToRanges(residueIndices);
             const chain = this.getPrimaryChain(item);
             const chainMap = this.getChainMap(item, chain);
-            const mappedRanges = mapRangesToAuth([{ start: residueIndex + 1, end: residueIndex + 1 }], chainMap);
+            const mappedRanges = mapRangesToAuth(ranges.map(range => ({
+                start: range.start,
+                end: range.end,
+            })), chainMap);
             if (!mappedRanges.length) return null;
             const useChain = item.chainIds && item.chainIds.size > 0 && item.chainIds.has(chain);
             return buildChainExpression(chain, mappedRanges, useChain);
+        },
+        buildHighlightExpression(entry, item) {
+            const selected = Array.isArray(this.selectedColumns) ? this.selectedColumns : [];
+            if (selected.length > 0) {
+                return this.buildColumnsExpression(entry, item, selected);
+            }
+            if (this.selectedColumn < 0) return null;
+            return this.buildColumnsExpression(entry, item, [this.selectedColumn]);
+        },
+        buildPreviewExpression(entry, item) {
+            if (!Number.isFinite(this.previewColumn) || this.previewColumn < 0) return null;
+            return this.buildColumnsExpression(entry, item, [this.previewColumn]);
         },
         async buildEntryPdb(index, entry) {
             if (this.pdbCache.has(index)) {
@@ -627,6 +652,9 @@ ENDMDL
                 if (item.overlays?.highlight) {
                     await this.stage.remove(item.overlays.highlight);
                 }
+                if (item.overlays?.preview) {
+                    await this.stage.remove(item.overlays.preview);
+                }
                 item.overlays = {};
             }
             if (token !== this.overlayToken) return;
@@ -665,7 +693,47 @@ ENDMDL
                         item.overlays.highlight = highlightComponent;
                     }
                 }
+                const previewExpr = this.buildPreviewExpression(entry, item);
+                if (previewExpr) {
+                    const previewComponent = await this.stage.createComponentFromExpression(
+                        item.structureRef,
+                        previewExpr,
+                        `preview-${item.index}-${token}`
+                    );
+                    if (previewComponent) {
+                        await this.stage.addRepresentation(previewComponent, {
+                            type: 'ball-and-stick',
+                            color: 'uniform',
+                            colorParams: { value: Color(0xec3f5f) },
+                        });
+                        item.overlays.preview = previewComponent;
+                    }
+                }
             }
+        },
+        async updateAllHighlights() {
+            await this.renderOverlays();
+        },
+        async updateAllPreview() {
+            await this.renderOverlays();
+        },
+        moveView(idx) {
+            if (!Number.isFinite(Number(idx)) || !this.stage) return;
+            const refItem = this.structureItems.find(item => item.index === this.reference) || this.structureItems[0];
+            if (!refItem) return;
+            const entry = this.entries[refItem.index];
+            if (!entry) return;
+            const expr = this.buildColumnsExpression(entry, refItem, [Number(idx)]);
+            if (!expr) {
+                this.focusReference();
+                return;
+            }
+            const loci = getSelectionLoci(expr, refItem.structureRef);
+            if (!loci) {
+                this.focusReference();
+                return;
+            }
+            this.stage.focusLoci(loci, this.transitionDuration);
         },
         async rebuildStructures(focus = true) {
             if (!this.stage || !this.stageReady) return;
@@ -721,6 +789,15 @@ ENDMDL
         },
         reference: function() {
             this.rebuildStructures(true);
+        },
+        selectedColumns: {
+            deep: true,
+            handler() {
+                this.renderOverlays();
+            },
+        },
+        previewColumn: function() {
+            this.renderOverlays();
         },
         entries: {
             deep: true,

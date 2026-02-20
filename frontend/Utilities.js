@@ -1,5 +1,3 @@
-// import { Selection, Matrix4, PdbWriter } from 'ngl';
-
 function tryLinkTargetToDB(target, db) {
     try {
         var res = db.toLowerCase();
@@ -394,19 +392,25 @@ function atomToPDBRow(ap) {
 }
 
 export function makeChainMap(structure, sele) {
-    let map = new Map()
+    let map = new Map();
+    if (!structure || typeof structure.eachResidue !== 'function') {
+        return map;
+    }
     let idx = 1;
     structure.eachResidue(rp => {
         map.set(idx++, { index: rp.index, resno: rp.resno });
-    }, new Selection(sele));
-    return map
+    });
+    return map;
 }
 
 export function makeSubPDB(structure, sele) {
     let pdb = [];
-    structure.eachAtom(ap => { pdb.push(atomToPDBRow(ap)) }, new Selection(sele));
-    return pdb.join('\n')
-} 
+    if (!structure || typeof structure.eachAtom !== 'function') {
+        return '';
+    }
+    structure.eachAtom(ap => { pdb.push(atomToPDBRow(ap)); });
+    return pdb.join('\n');
+}
 
 /**
  * Create a mock PDB from Ca data
@@ -472,6 +476,9 @@ export function debounce(func, delay) {
 // Generate THREE.Matrix4 from 3x3 rotation and 1x3 translation matrices
 // Can give this directly to StructureComponent.setTransform() to superpose
 export function makeMatrix4(translation, rotation) {
+    if (typeof Matrix4 === 'undefined') {
+        return { translation, rotation };
+    }
     const u = rotation.slice();
     for (let i = 0; i < 3; i++) {
         u[i].push(translation[i]);
@@ -486,6 +493,9 @@ export function makeMatrix4(translation, rotation) {
 // Slerp between Quaternions, linear interpolate position for some t (0.0-1.0)
 // Compose new Matrix4 for transformation.
 export function interpolateMatrices(a, b, t) {
+    if (typeof Quaternion === 'undefined' || typeof Vector3 === 'undefined' || typeof Matrix4 === 'undefined') {
+        return (t >= 1) ? b : a;
+    }
     const quaternionA = new Quaternion();
     const positionA   = new Vector3();
     const scaleA      = new Vector3();
@@ -600,6 +610,195 @@ export function checkMultimer(pdbString) {
 }
 
 export function getPdbText(comp) {
-    let pw = new PdbWriter(comp.structure, { renumberSerial: false });
-    return pw.getData().split('\n').filter(line => line.startsWith('ATOM')).join('\n');
+    if (!comp) {
+        return '';
+    }
+    if (typeof PdbWriter !== 'undefined' && comp.structure) {
+        let pw = new PdbWriter(comp.structure, { renumberSerial: false });
+        return pw.getData().split('\n').filter(line => line.startsWith('ATOM')).join('\n');
+    }
+    const text = typeof comp === 'string'
+        ? comp
+        : (typeof comp.data === 'string' ? comp.data : '');
+    return text.split('\n').filter(line => line.startsWith('ATOM')).join('\n');
+}
+
+export const humanReadibleFormat = (bytes) => {
+    const u = ['B', 'KB', 'MB', 'GB'];
+    let i = 0;
+    while (bytes >= 1024 && i < u.length - 1) {
+        bytes /= 1024;
+        i++;
+    }
+    return `${bytes.toFixed(2)} ${u[i]}`;
+};
+
+export const calculateStrSize = (v) => {
+    if (!v) return -1;
+
+    if (typeof v == 'string') {
+        return v.length * 2;
+    } else if (v instanceof Array) {
+        let byte = 0;
+        for (let s of v) {
+            if (typeof s == 'string') {
+                byte += s.length * 2;
+            } else if (s instanceof Object && !s.text && typeof s.text == 'string') {
+                byte += s.text.length * 2;
+            }
+        }
+        return byte;
+    } else {
+        return -1;
+    }
+};
+
+export function storeChains(pdb) {
+    const arr = [];
+    let c = '';
+    for (let line of pdb.split('\n')) {
+        if (line.startsWith('ATOM')) {
+            c = line.charAt(21);
+        } else if (line.startsWith('TER')) {
+            arr.push(c);
+        }
+    }
+    if (arr.length == 0) {
+        arr.push(c);
+    }
+    return arr;
+}
+
+export function revertChainInfo(pdb, chains) {
+    if (chains.length == 0 || chains[0] == '') {
+        return pdb;
+    }
+
+    const arr = [];
+    let i = 0;
+    for (let line of pdb.split('\n')) {
+        if (line.startsWith('ATOM')) {
+            line = line.slice(0, 21) + chains[i] + line.slice(22);
+        } else if (line.startsWith('TER')) {
+            i++;
+        }
+        arr.push(line);
+    }
+    return arr.join('\n');
+}
+
+export function mergePdbs(chainPdbs /* [{pdb, chain}] */) {
+    let serial = 1;
+    const out = [];
+    for (const { pdb, chain } of chainPdbs) {
+        const lines = pdb.split(/\r?\n/);
+        for (const line of lines) {
+            if (/^(ATOM  |HETATM)/.test(line)) {
+                let s = serial.toString().padStart(5, ' ');
+                let l = line.padEnd(80, ' ');
+                l = l.slice(0, 6) + s + l.slice(11);
+                l = l.substring(0, 21) + (chain[0] || 'A') + l.substring(22);
+                out.push(l);
+                serial++;
+            }
+        }
+        out.push('TER');
+    }
+    out.push('END');
+    return out.join('\n');
+}
+
+export function concatenatePdbs(chainPdbs /* [{pdb, chain}] */) {
+    let serial = 1;
+    const out = [];
+    for (const { pdb } of chainPdbs) {
+        const lines = pdb.split(/\r?\n/);
+        for (const line of lines) {
+            if (/^(ATOM  |HETATM)/.test(line)) {
+                let s = serial.toString().padStart(5, ' ');
+                let rs = serial.toString().padStart(4, ' ');
+                let l = line.padEnd(80, ' ');
+                l = l.slice(0, 6) + s + l.slice(11, 21) + 'A' + rs + l.slice(26);
+                out.push(l);
+                serial++;
+            }
+        }
+    }
+    out.push('TER');
+    out.push('END');
+    return out.join('\n');
+}
+
+export function getAbsOffsetTop($el) {
+    var sum = 0;
+    while ($el) {
+        sum += $el.offsetTop;
+        $el = $el.offsetParent;
+    }
+    return sum;
+}
+
+export const getChainName = (name) => {
+    if (/_v[0-9]+$/.test(name) || /^AF-\W+-/.test(name)) {
+        return 'A';
+    }
+    let pos = name.lastIndexOf('_');
+    if (pos != -1) {
+        let match = name.substring(pos + 1);
+        return match.length >= 1 && isNaN(Number(match[0])) ? match[0] : 'A';
+    }
+    return 'A';
+};
+
+export const getAccession = (name) => {
+    if (/^AF-\w+-/.test(name)) {
+        name = name.split('-')[1];
+    }
+    if (/_v[0-9]+$/.test(name)) {
+        return name;
+    }
+    if (/_unrelaxed_rank_/.test(name)) {
+        let pos = name.indexOf('_unrelaxed_rank_');
+        return pos != -1 ? name.substring(0, pos) : name;
+    }
+    let pos = name.lastIndexOf('_');
+    return pos != -1 ? name.substring(0, pos) : name;
+};
+
+export function throttle(func, delay) {
+    let lastCallTime = 0;
+    return function (...args) {
+        const context = this;
+        const now = Date.now();
+        if (now - lastCallTime >= delay) {
+            lastCallTime = now;
+            func.apply(context, args);
+        }
+    };
+}
+
+export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+export function getResidueIndices(seq, alnPoses) {
+    const result = [];
+    if (alnPoses.length == 0) {
+        return result;
+    }
+
+    let resno = 0;
+    let startPos = 0;
+    const sorted = [...alnPoses].sort((a, b) => a - b);
+    for (let p of sorted) {
+        for (let i = startPos; i <= p && i < seq.length; i++) {
+            if (seq[i] != '-') {
+                if (i == p) {
+                    result.push(resno++);
+                    startPos = i + 1;
+                    break;
+                }
+                resno++;
+            }
+        }
+    }
+    return result;
 }

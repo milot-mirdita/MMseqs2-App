@@ -343,7 +343,6 @@ const readQueryDataWithMolIo = async (queryPdb, format) => {
             return null;
         }
         const tokens = parsed.result?.lines;
-        console.log(tokens)
         return {
             chainIds: getChainIdsFromPdbTokens(tokens),
             serialMap: buildSerialResidueMapFromPdbTokens(tokens),
@@ -555,6 +554,36 @@ const buildAlignmentRanges = (alignments, kind, chainResolver) => {
     return rangesByChain;
 };
 
+const buildAlignedPairsFromBacktrace = (alignment, qChain, tChain) => {
+    const pairs = [];
+    const backtrace = alignment.backtrace || '';
+    if (!backtrace) {
+        return pairs;
+    }
+    let qPos = Number(alignment.qStartPos);
+    let tPos = Number(alignment.dbStartPos);
+    if (!Number.isFinite(qPos) || !Number.isFinite(tPos)) {
+        return pairs;
+    }
+    for (let i = 0; i < backtrace.length; i += 1) {
+        const code = backtrace[i];
+        if (code === 'M') {
+            pairs.push({ qChain, tChain, qPos, tPos });
+            qPos += 1;
+            tPos += 1;
+            continue;
+        }
+        if (code === 'I') {
+            qPos += 1;
+            continue;
+        }
+        if (code === 'D') {
+            tPos += 1;
+        }
+    }
+    return pairs;
+};
+
 const makeSubPdbFromRanges = (pdb, rangesByChain) => {
     if (!pdb) {
         return '';
@@ -623,6 +652,10 @@ export default {
             targetAlignmentChains: new Map(),
             queryStructureRef: null,
             targetStructureRef: null,
+            queryVisualComponentRefs: [],
+            targetVisualComponentRefs: [],
+            highlightComponentRef: null,
+            arrowRefs: [],
             renderToken: 0,
         }
     },
@@ -663,6 +696,22 @@ export default {
                 this.queryChains,
                 this.querySerialMap,
                 'qLen',
+            );
+        },
+        updateTargetAlignmentChainsFromStructure() {
+            if (!this.alignments || this.alignments.length === 0) {
+                this.targetAlignmentChains = new Map();
+                return;
+            }
+            if (!this.targetChains || this.targetChains.size === 0) {
+                return;
+            }
+            this.targetAlignmentChains = assignAlignmentChains(
+                this.alignments,
+                (alignment) => alignment.target,
+                this.targetChains,
+                this.targetSerialMap,
+                'dbLen',
             );
         },
         getAlignmentChain(kind, alignment, index) {
@@ -803,9 +852,12 @@ END
                 return pairs;
             }
             this.alignments.forEach((alignment, index) => {
+                const qChain = this.getAlignmentChain('query', alignment, index);
+                const tChain = this.getAlignmentChain('target', alignment, index);
                 const qAln = alignment.qAln || '';
                 const tAln = alignment.dbAln || alignment.tAln || '';
                 if (!qAln || !tAln) {
+                    pairs.push(...buildAlignedPairsFromBacktrace(alignment, qChain, tChain));
                     return;
                 }
                 let qPos = Number(alignment.qStartPos);
@@ -813,8 +865,6 @@ END
                 if (!Number.isFinite(qPos) || !Number.isFinite(tPos)) {
                     return;
                 }
-                const qChain = this.getAlignmentChain('query', alignment, index);
-                const tChain = this.getAlignmentChain('target', alignment, index);
                 const len = Math.min(qAln.length, tAln.length);
                 for (let i = 0; i < len; i += 1) {
                     const qChar = qAln[i];
@@ -858,7 +908,35 @@ END
             const expr = buildResidueAtomExpression(chain, resno, useChain, 'CA');
             return getSelectionLociSafe(expr, structureRef);
         },
-        async renderArrows() {
+        async removeStageRef(ref) {
+            if (!this.stage || !ref) return;
+            await this.stage.remove(ref);
+        },
+        async clearStageRefs(refs) {
+            if (!Array.isArray(refs) || refs.length === 0) return;
+            for (const ref of refs) {
+                await this.removeStageRef(ref);
+            }
+            refs.splice(0, refs.length);
+        },
+        async clearArrowMeasurements() {
+            await this.clearStageRefs(this.arrowRefs);
+        },
+        async clearQueryVisualComponents() {
+            await this.clearStageRefs(this.queryVisualComponentRefs);
+        },
+        async clearTargetVisualComponents() {
+            await this.clearStageRefs(this.targetVisualComponentRefs);
+        },
+        async clearVisualComponents() {
+            await this.clearTargetVisualComponents();
+            await this.clearQueryVisualComponents();
+            await this.removeStageRef(this.highlightComponentRef);
+            this.highlightComponentRef = null;
+            await this.clearArrowMeasurements();
+        },
+        async rerenderArrows() {
+            await this.clearArrowMeasurements();
             if (!this.stage || !this.showArrows) {
                 return;
             }
@@ -866,31 +944,218 @@ END
                 return;
             }
             const pairs = this.buildAlignedPairs(MAX_ARROW_PAIRS);
-            console.log(pairs);
             if (pairs.length === 0) {
                 return;
             }
-            const arrowColor = toMolstarColor(DEFAULT_ARROW_COLOR, DEFAULT_ARROW_COLOR);
-            const arrowParams = {
-                visualParams: { visuals: ['lines'] },
-                lineParams: {
-                    linesColor: arrowColor,
-                    linesSize: 0.05,
-                    dashLength: 0.2,
-                },
-            };
             for (const pair of pairs) {
-                debugger;
                 const qResno = this.getMappedResno('query', pair.qChain, pair.qPos);
                 const tResno = this.getMappedResno('target', pair.tChain, pair.tPos);
-                console.log(this.queryChains, this.targetChains)
-                const qLoci = this.getResidueLoci(this.queryStructureRef, pair.qChain, qResno, this.queryChains);
-                const tLoci = this.getResidueLoci(this.targetStructureRef, pair.tChain, tResno, this.targetChains);
+                let qLoci = this.getResidueLoci(this.queryStructureRef, pair.qChain, qResno, this.queryChains);
+                let tLoci = this.getResidueLoci(this.targetStructureRef, pair.tChain, tResno, this.targetChains);
+                if (!qLoci) {
+                    qLoci = getSelectionLociSafe(buildResidueAtomExpression(pair.qChain, qResno, false, 'CA'), this.queryStructureRef)
+                        || getSelectionLociSafe(buildResidueAtomExpression(pair.qChain, qResno, false, null), this.queryStructureRef);
+                }
+                if (!tLoci) {
+                    tLoci = getSelectionLociSafe(buildResidueAtomExpression(pair.tChain, tResno, false, 'CA'), this.targetStructureRef)
+                        || getSelectionLociSafe(buildResidueAtomExpression(pair.tChain, tResno, false, null), this.targetStructureRef);
+                }
                 if (!qLoci || !tLoci) {
                     continue;
                 }
-                await this.stage.addDistance(qLoci, tLoci, arrowParams);
+                const ref = await this.stage.addDistance(qLoci, tLoci);
+                if (ref) {
+                    this.arrowRefs.push(ref);
+                }
             }
+        },
+        async rerenderHighlight(highlightColor = toMolstarColor(DEFAULT_HIGHLIGHT_COLOR, DEFAULT_HIGHLIGHT_COLOR)) {
+            await this.removeStageRef(this.highlightComponentRef);
+            this.highlightComponentRef = null;
+            if (!this.targetStructureRef) {
+                return;
+            }
+            const highlightExpr = this.buildHighlightExpression();
+            if (!highlightExpr) {
+                return;
+            }
+            const highlightComponent = await this.stage.createComponentFromExpression(
+                this.targetStructureRef,
+                highlightExpr,
+                `target-highlight-${this.renderToken}`,
+            );
+            if (!highlightComponent) {
+                return;
+            }
+            await this.stage.addRepresentation(highlightComponent, {
+                type: 'ball-and-stick',
+                color: 'uniform',
+                colorParams: { value: highlightColor },
+            });
+            this.highlightComponentRef = highlightComponent;
+        },
+        isMultimerMode() {
+            const first = this.alignments?.[0];
+            if (!first || typeof first !== 'object') {
+                return false;
+            }
+            return Object.prototype.hasOwnProperty.call(first, 'complexu')
+                && Object.prototype.hasOwnProperty.call(first, 'complext');
+        },
+        async addSurfaceRepresentation(component, color, alpha = 0.12) {
+            await this.stage.addRepresentation(
+                component,
+                {
+                    type: 'molecular-surface',
+                    color: 'uniform',
+                    colorParams: { value: color },
+                },
+                { initialState: { alphaFactor: alpha } },
+            );
+        },
+        async renderTargetVisuals(token, targetAlignedColor, targetUnalignedColor, isMultimer) {
+            await this.clearTargetVisualComponents();
+            if (!this.targetStructureRef) {
+                return;
+            }
+            const targetStructure = this.targetStructureRef;
+            const alignedExpr = this.buildSelectionExpression('target', 0);
+            const chainExpr = this.buildSelectionExpression('target', 1);
+            const fullExpr = MS.struct.generator.all();
+
+            if (this.showTarget === 0) {
+                const alignedComponent = await this.stage.createComponentFromExpression(targetStructure, alignedExpr, `target-aligned-${token}`);
+                if (alignedComponent) {
+                    await this.stage.addRepresentation(alignedComponent, {
+                        type: 'cartoon',
+                        color: 'uniform',
+                        colorParams: { value: targetAlignedColor },
+                    });
+                    this.targetVisualComponentRefs.push(alignedComponent);
+                }
+                if (isMultimer) {
+                    const surfaceComponent = await this.stage.createComponentFromExpression(targetStructure, alignedExpr, `target-surface-aligned-${token}`);
+                    if (surfaceComponent) {
+                        await this.addSurfaceRepresentation(surfaceComponent, targetAlignedColor, 0.14);
+                        this.targetVisualComponentRefs.push(surfaceComponent);
+                    }
+                }
+                return;
+            }
+
+            const visibleExpr = this.showTarget === 2 ? fullExpr : chainExpr;
+            const unalignedExpr = MS.struct.modifier.exceptBy({ 0: visibleExpr, by: alignedExpr });
+            const unalignedComponent = await this.stage.createComponentFromExpression(targetStructure, unalignedExpr, `target-unaligned-${token}`);
+            if (unalignedComponent) {
+                await this.stage.addRepresentation(unalignedComponent, {
+                    type: 'cartoon',
+                    color: 'uniform',
+                    colorParams: { value: targetUnalignedColor },
+                });
+                this.targetVisualComponentRefs.push(unalignedComponent);
+            }
+            const alignedComponent = await this.stage.createComponentFromExpression(targetStructure, alignedExpr, `target-aligned-${token}`);
+            if (alignedComponent) {
+                await this.stage.addRepresentation(alignedComponent, {
+                    type: 'cartoon',
+                    color: 'uniform',
+                    colorParams: { value: targetAlignedColor },
+                });
+                this.targetVisualComponentRefs.push(alignedComponent);
+            }
+            if (isMultimer) {
+                const surfaceSourceExpr = this.showTarget === 2 ? fullExpr : chainExpr;
+                const surfaceComponent = await this.stage.createComponentFromExpression(targetStructure, surfaceSourceExpr, `target-surface-${token}`);
+                if (surfaceComponent) {
+                    await this.addSurfaceRepresentation(surfaceComponent, targetAlignedColor, this.showTarget === 2 ? 0.10 : 0.14);
+                    this.targetVisualComponentRefs.push(surfaceComponent);
+                }
+            }
+        },
+        async renderQueryVisuals(token, queryAlignedColor, queryUnalignedColor, isMultimer) {
+            await this.clearQueryVisualComponents();
+            if (!this.queryStructureRef) {
+                return;
+            }
+            const queryStructure = this.queryStructureRef;
+            const alignedExpr = this.buildSelectionExpression('query', 0);
+            const chainExpr = this.buildSelectionExpression('query', 1);
+            const fullExpr = MS.struct.generator.all();
+
+            if (this.showQuery === 0) {
+                const alignedComponent = await this.stage.createComponentFromExpression(queryStructure, alignedExpr, `query-aligned-${token}`);
+                if (alignedComponent) {
+                    await this.stage.addRepresentation(alignedComponent, {
+                        type: 'cartoon',
+                        color: 'uniform',
+                        colorParams: { value: queryAlignedColor },
+                    });
+                    this.queryVisualComponentRefs.push(alignedComponent);
+                }
+                if (isMultimer) {
+                    const surfaceComponent = await this.stage.createComponentFromExpression(queryStructure, alignedExpr, `query-surface-aligned-${token}`);
+                    if (surfaceComponent) {
+                        await this.addSurfaceRepresentation(surfaceComponent, queryAlignedColor, 0.14);
+                        this.queryVisualComponentRefs.push(surfaceComponent);
+                    }
+                }
+                return;
+            }
+
+            const visibleExpr = this.showQuery === 2 ? fullExpr : chainExpr;
+            const unalignedExpr = MS.struct.modifier.exceptBy({ 0: visibleExpr, by: alignedExpr });
+            const unalignedComponent = await this.stage.createComponentFromExpression(queryStructure, unalignedExpr, `query-unaligned-${token}`);
+            if (unalignedComponent) {
+                await this.stage.addRepresentation(unalignedComponent, {
+                    type: 'cartoon',
+                    color: 'uniform',
+                    colorParams: { value: queryUnalignedColor },
+                });
+                this.queryVisualComponentRefs.push(unalignedComponent);
+            }
+            const alignedComponent = await this.stage.createComponentFromExpression(queryStructure, alignedExpr, `query-aligned-${token}`);
+            if (alignedComponent) {
+                await this.stage.addRepresentation(alignedComponent, {
+                    type: 'cartoon',
+                    color: 'uniform',
+                    colorParams: { value: queryAlignedColor },
+                });
+                this.queryVisualComponentRefs.push(alignedComponent);
+            }
+            if (isMultimer) {
+                const surfaceSourceExpr = this.showQuery === 2 ? fullExpr : chainExpr;
+                const surfaceComponent = await this.stage.createComponentFromExpression(queryStructure, surfaceSourceExpr, `query-surface-${token}`);
+                if (surfaceComponent) {
+                    await this.addSurfaceRepresentation(surfaceComponent, queryAlignedColor, this.showQuery === 2 ? 0.10 : 0.14);
+                    this.queryVisualComponentRefs.push(surfaceComponent);
+                }
+            }
+        },
+        async rerenderTargetVisuals() {
+            if (!this.stage || !this.stageReady) {
+                return;
+            }
+            const token = ++this.renderToken;
+            await this.stageReady;
+            if (token !== this.renderToken) {
+                return;
+            }
+            const targetAlignedColor = toMolstarColor(this.targetAlignedColor, DEFAULT_TARGET_COLOR);
+            const targetUnalignedColor = toMolstarColor(this.targetUnalignedColor, DEFAULT_TARGET_UNALIGNED_COLOR);
+            await this.renderTargetVisuals(token, targetAlignedColor, targetUnalignedColor, this.isMultimerMode());
+        },
+        async rerenderQueryVisuals() {
+            if (!this.stage || !this.stageReady) {
+                return;
+            }
+            const token = ++this.renderToken;
+            await this.stageReady;
+            if (token !== this.renderToken) {
+                return;
+            }
+            const queryAlignedColor = toMolstarColor(this.queryAlignedColor, DEFAULT_QUERY_COLOR);
+            const queryUnalignedColor = toMolstarColor(this.queryUnalignedColor, DEFAULT_QUERY_UNALIGNED_COLOR);
+            await this.renderQueryVisuals(token, queryAlignedColor, queryUnalignedColor, this.isMultimerMode());
         },
         buildHighlightExpression() {
             if (!Array.isArray(this.highlights) || this.highlights.length === 0) {
@@ -1032,20 +1297,26 @@ END
                 }
             }
             let targetPdb = mergePdbChunks(targets);
-            if (this.alignments[0]?.complexu && this.alignments[0]?.complext) {
-                const t = this.alignments[0].complext.split(',').map(x => parseFloat(x));
-                const uFlat = this.alignments[0].complexu.split(',').map(x => parseFloat(x));
-                const u = [
-                    [uFlat[0], uFlat[1], uFlat[2]],
-                    [uFlat[3], uFlat[4], uFlat[5]],
-                    [uFlat[6], uFlat[7], uFlat[8]],
-                ];
-                targetPdb = transformPdb(targetPdb, t, u);
+            const isMultimer = this.isMultimerMode();
+            if (isMultimer) {
+                const complexT = typeof this.alignments[0].complext === 'string' ? this.alignments[0].complext : '';
+                const complexU = typeof this.alignments[0].complexu === 'string' ? this.alignments[0].complexu : '';
+                const t = complexT.split(',').map(x => parseFloat(x));
+                const uFlat = complexU.split(',').map(x => parseFloat(x));
+                if (t.length === 3 && uFlat.length === 9 && t.every(Number.isFinite) && uFlat.every(Number.isFinite)) {
+                    const u = [
+                        [uFlat[0], uFlat[1], uFlat[2]],
+                        [uFlat[3], uFlat[4], uFlat[5]],
+                        [uFlat[6], uFlat[7], uFlat[8]],
+                    ];
+                    targetPdb = transformPdb(targetPdb, t, u);
+                }
             }
             if (targetPdb) {
                 this.targetChains = getChainIdsFromPdb(targetPdb);
                 this.targetSerialMap = buildSerialResidueMap(targetPdb);
-                if (this.hasQuery && this.queryData && !this.alignments[0]?.complexu) {
+                this.updateTargetAlignmentChainsFromStructure();
+                if (this.hasQuery && this.queryData && !isMultimer) {
                     if (this.queryData.format === 'pdb') {
                         try {
                             const alnFasta = `>target\n${this.alignments[0].dbAln}\n\n>query\n${this.alignments[0].qAln}`;
@@ -1070,9 +1341,13 @@ END
                 }
                 this.targetData = { data: targetPdb, format: 'pdb', label: 'target' };
                 this.lastTargetPdb = targetPdb;
+            } else {
+                this.targetChains = new Set();
+                this.targetSerialMap = new Map();
+                this.targetAlignmentChains = new Map();
             }
         },
-        async renderStructures(focus = true) {
+        async renderStructures(focus = true, reloadStructures = true) {
             if (!this.stage || !this.stageReady) {
                 return;
             }
@@ -1082,105 +1357,38 @@ END
                 return;
             }
 
-            await this.stage.clear();
-            this.queryStructureRef = null;
-            this.targetStructureRef = null;
-
             const queryAlignedColor = toMolstarColor(this.queryAlignedColor, DEFAULT_QUERY_COLOR);
             const queryUnalignedColor = toMolstarColor(this.queryUnalignedColor, DEFAULT_QUERY_UNALIGNED_COLOR);
             const targetAlignedColor = toMolstarColor(this.targetAlignedColor, DEFAULT_TARGET_COLOR);
             const targetUnalignedColor = toMolstarColor(this.targetUnalignedColor, DEFAULT_TARGET_UNALIGNED_COLOR);
             const highlightColor = toMolstarColor(DEFAULT_HIGHLIGHT_COLOR, DEFAULT_HIGHLIGHT_COLOR);
+            const isMultimer = this.isMultimerMode();
 
-            if (this.targetData) {
-                const targetStructure = await this.stage.loadStructure(this.targetData);
-                this.targetStructureRef = targetStructure;
-                const alignedExpr = this.buildSelectionExpression('target', 0);
-                if (this.showTarget === 0) {
-                    const alignedComponent = await this.stage.createComponentFromExpression(targetStructure, alignedExpr, `target-aligned-${token}`);
-                    if (alignedComponent) {
-                        await this.stage.addRepresentation(alignedComponent, {
-                            type: 'cartoon',
-                            color: 'uniform',
-                            colorParams: { value: targetAlignedColor },
-                        });
-                    }
-                } else {
-                    const fullExpr = (this.showTarget === 2)
-                        ? MS.struct.generator.all()
-                        : this.buildSelectionExpression('target', 1);
-                    const unalignedExpr = MS.struct.modifier.exceptBy({ 0: fullExpr, by: alignedExpr });
-                    const unalignedComponent = await this.stage.createComponentFromExpression(targetStructure, unalignedExpr, `target-unaligned-${token}`);
-                    if (unalignedComponent) {
-                        await this.stage.addRepresentation(unalignedComponent, {
-                            type: 'cartoon',
-                            color: 'uniform',
-                            colorParams: { value: targetUnalignedColor },
-                        });
-                    }
-                    const alignedComponent = await this.stage.createComponentFromExpression(targetStructure, alignedExpr, `target-aligned-${token}`);
-                    if (alignedComponent) {
-                        await this.stage.addRepresentation(alignedComponent, {
-                            type: 'cartoon',
-                            color: 'uniform',
-                            colorParams: { value: targetAlignedColor },
-                        });
-                    }
+            const needLoadTarget = reloadStructures || (this.targetData && !this.targetStructureRef);
+            const needLoadQuery = reloadStructures || (this.queryData && !this.queryStructureRef);
+            if (reloadStructures || needLoadTarget || needLoadQuery) {
+                await this.stage.clear();
+                this.queryStructureRef = null;
+                this.targetStructureRef = null;
+                this.queryVisualComponentRefs = [];
+                this.targetVisualComponentRefs = [];
+                this.highlightComponentRef = null;
+                this.arrowRefs = [];
+                if (this.targetData) {
+                    this.targetStructureRef = await this.stage.loadStructure(this.targetData);
                 }
+                if (this.queryData) {
+                    this.queryStructureRef = await this.stage.loadStructure(this.queryData);
+                }
+            } else {
+                await this.clearVisualComponents();
             }
 
-            if (this.queryData) {
-                const queryStructure = await this.stage.loadStructure(this.queryData);
-                this.queryStructureRef = queryStructure;
-                const alignedExpr = this.buildSelectionExpression('query', 0);
-                if (this.showQuery === 0) {
-                    const alignedComponent = await this.stage.createComponentFromExpression(queryStructure, alignedExpr, `query-aligned-${token}`);
-                    if (alignedComponent) {
-                        await this.stage.addRepresentation(alignedComponent, {
-                            type: 'cartoon',
-                            color: 'uniform',
-                            colorParams: { value: queryAlignedColor },
-                        });
-                    }
-                } else {
-                    const fullExpr = (this.showQuery === 2)
-                        ? MS.struct.generator.all()
-                        : this.buildSelectionExpression('query', 1);
-                    const unalignedExpr = MS.struct.modifier.exceptBy({ 0: fullExpr, by: alignedExpr });
-                    const unalignedComponent = await this.stage.createComponentFromExpression(queryStructure, unalignedExpr, `query-unaligned-${token}`);
-                    if (unalignedComponent) {
-                        await this.stage.addRepresentation(unalignedComponent, {
-                            type: 'cartoon',
-                            color: 'uniform',
-                            colorParams: { value: queryUnalignedColor },
-                        });
-                    }
-                    const alignedComponent = await this.stage.createComponentFromExpression(queryStructure, alignedExpr, `query-aligned-${token}`);
-                    if (alignedComponent) {
-                        await this.stage.addRepresentation(alignedComponent, {
-                            type: 'cartoon',
-                            color: 'uniform',
-                            colorParams: { value: queryAlignedColor },
-                        });
-                    }
-                }
-            }
+            await this.renderTargetVisuals(token, targetAlignedColor, targetUnalignedColor, isMultimer);
+            await this.renderQueryVisuals(token, queryAlignedColor, queryUnalignedColor, isMultimer);
 
-            if (this.targetStructureRef) {
-                const highlightExpr = this.buildHighlightExpression();
-                if (highlightExpr) {
-                    const highlightComponent = await this.stage.createComponentFromExpression(this.targetStructureRef, highlightExpr, `target-highlight-${token}`);
-                    if (highlightComponent) {
-                        await this.stage.addRepresentation(highlightComponent, {
-                            type: 'ball-and-stick',
-                            color: 'uniform',
-                            colorParams: { value: highlightColor },
-                        });
-                    }
-                }
-            }
-
-            await this.renderArrows();
+            await this.rerenderHighlight(highlightColor);
+            await this.rerenderArrows();
 
             const focusRef = this.queryStructureRef || this.targetStructureRef;
             if (focus) {
@@ -1194,19 +1402,19 @@ END
             if (!this.stage) {
                 return;
             }
-            this.renderStructures(true);
+            this.rerenderQueryVisuals();
         },
         'showTarget': function(val, _) {
             if (!this.stage) {
                 return;
             }
-            this.renderStructures(true);
+            this.rerenderTargetVisuals();
         },
         'showArrows': function() {
             if (!this.stage) {
                 return;
             }
-            this.renderStructures(false);
+            this.rerenderArrows();
         },
         'highlights': {
             deep: true,
@@ -1214,7 +1422,7 @@ END
                 if (!this.stage) {
                     return;
                 }
-                this.renderStructures(false);
+                this.rerenderHighlight();
             },
         }
     },
@@ -1248,7 +1456,7 @@ END
         }
         await this.stageReady;
         await this.loadStructureData();
-        await this.renderStructures();
+        await this.renderStructures(true, true);
     },
 }
 </script>
